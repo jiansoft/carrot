@@ -33,20 +33,29 @@ func main() {
 	log.Printf("memory.Read(%s) = %v,%v", key1, ok, v)
 
 	memory.Forget(key1)
+	log.Printf("memory.Forget(%s)", key1)
 	log.Printf("memory.Have(%s) = %v", key1, memory.Have(key1))
 	log.Printf("carrot.Default.Have(%s) = %v", key1, carrot.Default.Have(key1))
 
-	/* carrot.Default.Keep(key1, val, time.Second)
-	   log.Printf("carrot.Default.Have(%s) = %v", key1, carrot.Default.Have(key1))
+	carrot.Default.Keep(key1, val, carrot.CacheEntryOptions{TimeToLive: time.Second})
+	log.Printf("carrot.Default.Have(%s) = %v", key1, carrot.Default.Have(key1))
 
-	   v, ok = carrot.Default.Read(key1)
-	   log.Printf("carrot.Default.Read(%s) = %v,%v", key1, ok, v)
+	v, ok = carrot.Default.Read(key1)
+	log.Printf("carrot.Default.Read(%s) = %v,%v", key1, ok, v)
 
-	   carrot.Default.Forget(key1)
-	   log.Printf("carrot.Default.Have(%s) = %v", key1, carrot.Default.Have(key1))
+	carrot.Default.Forget(key1)
+	log.Printf("carrot.Default.Have(%s) = %v", key1, carrot.Default.Have(key1))
 
-	   robin.Every(1).Seconds().Do(func() {
-	       memory.Keep(time.Now().Format("05"), val, time.Hour)
-	   })*/
+	robin.Every(9).Seconds().Do(func() {
+		//memory.Keep(time.Now().Format("05"), val, carrot.CacheEntryOptions{TimeToLive: time.Second})
+		ttlKey := "ttl" + time.Now().Format("05")
+		memory.Keep(ttlKey, val, carrot.CacheEntryOptions{TimeToLive: 10 * time.Second})
+		inactiveKey := "inactive" + time.Now().Format("05")
+		memory.Keep(inactiveKey, val, carrot.CacheEntryOptions{TimeToLive: -time.Second, SlidingExpiration: 10 * time.Second})
+	})
+	robin.Every(10).Seconds().Do(func() {
+		state := memory.Statistics()
+		log.Printf("state %+v", state)
+	})
 	_, _ = fmt.Scanln()
 }

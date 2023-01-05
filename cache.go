@@ -6,19 +6,6 @@ import (
 	"github.com/jiansoft/robin"
 )
 
-type MemoryCache interface {
-	// Keep Create or overwrite an entry in the cache.
-	Keep(key any, value any, option CacheEntryOptions)
-	// Read Gets the item associated with this key if present.
-	Read(key any) (value any, ok bool)
-	//Have Returns true if this key present.
-	Have(key any) (ok bool)
-	// Forget Removes the object associated with the given key.
-	Forget(key any)
-	// Reset Removes all object from the cache
-	Reset()
-}
-
 var (
 	store   *CacheCoherent
 	once    sync.Once
@@ -26,7 +13,7 @@ var (
 )
 
 // memoryCache returns CacheCoherent singleton instance
-func memoryCache() MemoryCache {
+func memoryCache() *CacheCoherent {
 	once.Do(func() {
 		store = newCacheCoherent()
 	})
@@ -38,11 +25,14 @@ func New() *CacheCoherent {
 	return newCacheCoherent()
 }
 
-func erase(m *sync.Map) {
-	m.Range(func(key, value any) bool {
-		m.Delete(key)
-		return true
-	})
+func erase(targets ...*sync.Map) {
+	for _, target := range targets {
+		target.Range(func(k, v any) bool {
+			target.Delete(k)
+			return true
+		})
+	}
+
 }
 
 type parallelCount struct {

@@ -21,7 +21,7 @@ type (
 		usageSliding sync.Map
 		// prevent pq from data race
 		muForPriorityQueue sync.Mutex
-		stats              cacheStatistics
+		stats              CacheStatistics
 		onScanForExpired   atomic.Bool
 		// how often to expiration scan all the cache
 		expirationScanFrequency int64
@@ -36,7 +36,7 @@ func newCacheCoherent(capacity ...int) *CacheCoherent {
 
 	coherent := &CacheCoherent{
 		pq:                      newPriorityQueue(queueCapacity),
-		stats:                   cacheStatistics{},
+		stats:                   CacheStatistics{},
 		excisionsC:              make(chan any, queueCapacity),
 		lastExpirationScan:      time.Now().UTC().UnixNano(),
 		expirationScanFrequency: int64(time.Minute),
@@ -200,8 +200,7 @@ func (cc *CacheCoherent) Forget(key any) {
 
 // Reset removes all items from the memory
 func (cc *CacheCoherent) Reset() {
-	erase(&cc.usageNormal)
-	erase(&cc.usageSliding)
+	erase(&cc.usageNormal, &cc.usageSliding)
 	cc.muForPriorityQueue.Lock()
 	cc.pq.erase()
 	cc.muForPriorityQueue.Unlock()
@@ -268,43 +267,16 @@ func (cc *CacheCoherent) consumeExcisions() {
 	}
 }
 
-func (cc *CacheCoherent) statistics() cacheStatistics {
+func (cc *CacheCoherent) Statistics() CacheStatistics {
 	sliding := &parallelCount{source: &cc.usageSliding}
 	normal := &parallelCount{source: &cc.usageNormal}
+	priorityQueueCount := cc.pq.Len()
 	parallelCountMap(normal, sliding)
-	/*var (
-	    usageSlidingEntryCount int
-	    usageNormalEntryCount  int
-	    wg                     = sync.WaitGroup{}
-	)*/
-	//wg.Add(1)
-	//robin.RightNow().Do(func(source *sync.Map, swg *sync.WaitGroup) {
-	//    source.Range(func(k, v any) bool {
-	//        usageSlidingEntryCount++
-	//        return true
-	//    })
-	//    swg.Done()
-	//}, &cc.usageSliding, &wg)
-	//
-	//wg.Add(1)
-	//robin.RightNow().Do(func(source *sync.Map, swg *sync.WaitGroup) {
-	//    source.Range(func(k, v any) bool {
-	//        usageNormalEntryCount++
-	//        return true
-	//    })
-	//    swg.Done()
-	//}, &cc.usageNormal, &wg)
-	//
-	//wg.Wait()
-	/* cc.usageNormal.Range(func(k, v any) bool {
-	    usageNormalEntryCount++
-	    return true
-	})*/
 
-	statistics := cacheStatistics{
+	statistics := CacheStatistics{
 		usageSlidingEntryCount: sliding.count,
 		usageNormalEntryCount:  normal.count,
-		priorityQueueCount:     cc.pq.Len(),
+		priorityQueueCount:     priorityQueueCount,
 		totalMisses:            atomic.LoadInt64(&cc.stats.totalMisses),
 		totalHits:              atomic.LoadInt64(&cc.stats.totalHits),
 	}

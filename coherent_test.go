@@ -49,8 +49,8 @@ func Test_CacheCoherent(t *testing.T) {
 			val, _ := tt.memoryCache.Read(1)
 			equal(t, val, 1)
 
-			s := tt.memoryCache.statistics()
-			t.Logf("statistics %+v", s)
+			s := tt.memoryCache.Statistics()
+			t.Logf("Statistics %+v", s)
 			equal(t, s.usageNormalEntryCount, tt.want)
 		})
 	}
@@ -114,7 +114,7 @@ func Test_DataRace(t *testing.T) {
 			}, tt.loop, tt.memoryCache, &wg)
 
 			wg.Wait()
-			t.Logf("statistics %+v", tt.memoryCache.statistics())
+			t.Logf("Statistics %+v", tt.memoryCache.Statistics())
 			wg.Add(1)
 			robin.RightNow().Do(keep, tt.loop, tt.memoryCache, &wg, 1)
 			wg.Add(1)
@@ -127,9 +127,9 @@ func Test_DataRace(t *testing.T) {
 			robin.RightNow().Do(keep, tt.loop, tt.memoryCache, &wg, 3)
 			wg.Wait()
 
-			t.Logf("statistics %+v", tt.memoryCache.statistics())
+			t.Logf("Statistics %+v", tt.memoryCache.Statistics())
 			tt.memoryCache.Reset()
-			t.Logf("Reset statistics %+v", tt.memoryCache.statistics())
+			t.Logf("Reset Statistics %+v", tt.memoryCache.Statistics())
 		})
 	}
 }
@@ -180,11 +180,13 @@ func TestCacheCoherent_KeepDelayOrInactive(t *testing.T) {
 			} else {
 				if v, o := val.(string); !o || v != tt.args.val {
 					log.Fatalf("KeepDelayOrInactive ttl Fatal")
+				} else {
+					equal(t, v, tt.args.val)
 				}
 			}
 
-			state := cc.statistics()
-			//t.Logf("ttl statistics %+v", state)
+			state := cc.Statistics()
+			//t.Logf("ttl Statistics %+v", state)
 			equal(t, state.usageNormalEntryCount, 1)
 			equal(t, state.priorityQueueCount, 1)
 			equal(t, state.totalHits, int64(1))
@@ -194,13 +196,17 @@ func TestCacheCoherent_KeepDelayOrInactive(t *testing.T) {
 			<-time.After(100 * time.Millisecond)
 			cc.Read(tt.args.key)
 			<-time.After(100 * time.Millisecond)
-			state = cc.statistics()
-			//t.Logf("ttl statistics %+v", state)
+			state = cc.Statistics()
+			//t.Logf("ttl Statistics %+v", state)
 			equal(t, state.usageNormalEntryCount, 0)
 			equal(t, state.priorityQueueCount, 0)
 			equal(t, state.totalHits, int64(1))
 			equal(t, state.totalMisses, int64(1))
 			equal(t, state.usageSlidingEntryCount, 0)
+
+			if _, ok := cc.Read(tt.args.key); ok {
+				log.Fatalf("KeepDelayOrInactive ttl Fatal")
+			}
 
 			cc.Reset()
 
@@ -210,12 +216,14 @@ func TestCacheCoherent_KeepDelayOrInactive(t *testing.T) {
 				log.Fatalf("KeepDelayOrInactive inactive Fatal")
 			} else {
 				if v, o := val.(string); !o || v != tt.args.val {
-					log.Fatalf("KeepDelayOrInactive ttl Fatal")
+					log.Fatalf("KeepDelayOrInactive inactive Fatal")
+				} else {
+					equal(t, v, tt.args.val)
 				}
 			}
 
-			state = cc.statistics()
-			// t.Logf("inactive statistics %+v", state)
+			state = cc.Statistics()
+			t.Logf("inactive Statistics %+v", state)
 			equal(t, state.usageNormalEntryCount, 0)
 			equal(t, state.priorityQueueCount, 0)
 			equal(t, state.totalHits, int64(1))
@@ -224,14 +232,17 @@ func TestCacheCoherent_KeepDelayOrInactive(t *testing.T) {
 			<-time.After(100 * time.Millisecond)
 			cc.Read(tt.args.key)
 			<-time.After(100 * time.Millisecond)
-			state = cc.statistics()
-			// t.Logf("inactive statistics %+v", state)
+			state = cc.Statistics()
+			t.Logf("inactive Statistics %+v", state)
 			equal(t, state.usageNormalEntryCount, 0)
 			equal(t, state.priorityQueueCount, 0)
 			equal(t, state.totalHits, int64(1))
 			equal(t, state.totalMisses, int64(1))
 			equal(t, state.usageSlidingEntryCount, 0)
 
+			if _, ok := cc.Read(tt.args.key); ok {
+				log.Fatalf("KeepDelayOrInactive inactive Fatal")
+			}
 		})
 	}
 }

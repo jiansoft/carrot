@@ -1,6 +1,6 @@
 package carrot
 
-type cacheStatistics struct {
+type CacheStatistics struct {
 	totalMisses            int64
 	totalHits              int64
 	usageNormalEntryCount  int

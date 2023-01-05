@@ -82,19 +82,19 @@ func (ce *cacheEntry) checkExpired(utcNow int64) bool {
 	return ce.isExpired || ce.checkForExpiredTime(utcNow)
 }
 
-// checkForExpiredTime returns true if the item has expired .
+// checkForExpiredTime returns true if the item has expired (and set it to expire).
 func (ce *cacheEntry) checkForExpiredTime(utcNow int64) bool {
 	if ce.absoluteExpiration < 0 && ce.slidingExpiration == 0 {
 		// never expired
 		return false
 	}
 
-	if ce.absoluteExpiration <= utcNow {
+	if ce.isSlidingTypeCache() && (utcNow-ce.lastAccessed) >= ce.slidingExpiration {
 		ce.setExpired(expired)
 		return true
 	}
 
-	if ce.isSlidingTypeCache() && (utcNow-ce.lastAccessed) >= ce.slidingExpiration {
+	if ce.absoluteExpiration <= utcNow {
 		ce.setExpired(expired)
 		return true
 	}
