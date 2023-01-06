@@ -57,5 +57,6 @@ func main() {
 		state := memory.Statistics()
 		log.Printf("state %+v", state)
 	})
+
 	_, _ = fmt.Scanln()
 }
