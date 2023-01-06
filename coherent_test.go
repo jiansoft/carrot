@@ -34,7 +34,7 @@ func Test_CacheCoherent(t *testing.T) {
 				tt.memoryCache.Forget(key)
 				yes = tt.memoryCache.Have(key)
 				equal(t, yes, false)
-				val, ok = tt.memoryCache.Read(key)
+				_, ok = tt.memoryCache.Read(key)
 				equal(t, ok, false)
 			}
 			tt.memoryCache.Forget("noKey")
