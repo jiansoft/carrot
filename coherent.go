@@ -14,8 +14,8 @@ var queueCapacity = 2048
 type (
 	// CacheCoherent Wrapper for the memory cache entries collection.
 	CacheCoherent struct {
-		excisionsC chan any
-		pq         *priorityQueue
+		// excisionNormalC chan any
+		pq *priorityQueue
 		// save cache item.
 		usageNormal  sync.Map
 		usageSliding sync.Map
@@ -35,14 +35,13 @@ func newCacheCoherent(capacity ...int) *CacheCoherent {
 	}
 
 	coherent := &CacheCoherent{
-		pq:                      newPriorityQueue(queueCapacity),
-		stats:                   CacheStatistics{},
-		excisionsC:              make(chan any, queueCapacity),
+		pq:    newPriorityQueue(queueCapacity),
+		stats: CacheStatistics{},
+		//excisionNormalC:         make(chan any, queueCapacity),
 		lastExpirationScan:      time.Now().UTC().UnixNano(),
 		expirationScanFrequency: int64(time.Minute),
 	}
 
-	robin.RightNow().Do(coherent.consumeExcisions)
 	return coherent
 }
 
@@ -107,17 +106,6 @@ func (cc *CacheCoherent) Keep(key any, val any, option CacheEntryOptions) {
 		priority = utcAbsExp
 	}
 
-	if priorEntry, exist := cc.loadCacheEntryFromUsage(key); exist {
-		priorEntry.setExpired(replaced)
-		if priorEntry.isSlidingTypeCache() {
-			cc.usageSliding.Delete(priorEntry.key)
-		} else {
-			cc.muForPriorityQueue.Lock()
-			cc.pq.update(priorEntry)
-			cc.muForPriorityQueue.Unlock()
-		}
-	}
-
 	newEntry := &cacheEntry{
 		key:                key,
 		value:              val,
@@ -132,18 +120,17 @@ func (cc *CacheCoherent) Keep(key any, val any, option CacheEntryOptions) {
 		newEntry.slidingExpiration = int64(option.SlidingExpiration)
 	}
 
+	cc.forget(key, nowUtc)
+
 	if !newEntry.checkExpired(nowUtc) {
 		if newEntry.isSlidingTypeCache() {
 			// 如果有設定inactive時效時要改放在 usageSliding ，降低 map range 時鎖定的時間
 			cc.usageSliding.Store(key, newEntry)
 		} else {
 			cc.usageNormal.Store(key, newEntry)
-			if !newEntry.isNeverExpired() {
-				// 永不到期不用存到 pq
-				cc.muForPriorityQueue.Lock()
-				cc.pq.enqueue(newEntry)
-				cc.muForPriorityQueue.Unlock()
-			}
+			cc.muForPriorityQueue.Lock()
+			cc.pq.enqueue(newEntry)
+			cc.muForPriorityQueue.Unlock()
 		}
 	}
 
@@ -157,22 +144,16 @@ func (cc *CacheCoherent) Read(key any) (any, bool) {
 		if !ce.checkExpired(nowUtc) {
 			atomic.AddInt64(&cc.stats.totalHits, 1)
 			ce.lastAccessed = nowUtc
+			cc.scanForExpiredItemsIfNeeded(nowUtc)
 			return ce.value, true
-		}
-
-		if ce.isSlidingTypeCache() {
-			cc.usageSliding.Delete(ce.key)
-		} else {
-			cc.muForPriorityQueue.Lock()
-			cc.pq.update(ce)
-			cc.muForPriorityQueue.Unlock()
 		}
 	}
 
 	atomic.AddInt64(&cc.stats.totalMisses, 1)
-	cc.scanForExpiredItemsIfNeeded(nowUtc)
-	return nil, false
 
+	cc.scanForExpiredItemsIfNeeded(nowUtc)
+
+	return nil, false
 }
 
 // Have returns true if the memory has the item, and it's not expired.
@@ -183,18 +164,22 @@ func (cc *CacheCoherent) Have(key any) bool {
 
 // Forget removes an item from the memory
 func (cc *CacheCoherent) Forget(key any) {
+	cc.forget(key, time.Now().UTC().UnixNano())
+}
+
+func (cc *CacheCoherent) forget(key any, nowUtc int64) {
 	if ce, exist := cc.loadCacheEntryFromUsage(key); exist {
+		ce.setExpired(removed)
 		if ce.isSlidingTypeCache() {
 			cc.usageSliding.Delete(key)
 		} else {
-			ce.setExpired(removed)
+			cc.usageNormal.Delete(key)
 			cc.muForPriorityQueue.Lock()
 			cc.pq.update(ce)
 			cc.muForPriorityQueue.Unlock()
 		}
 	}
 
-	nowUtc := time.Now().UTC().UnixNano()
 	cc.scanForExpiredItemsIfNeeded(nowUtc)
 }
 
@@ -210,61 +195,88 @@ func (cc *CacheCoherent) Reset() {
 
 // loadCacheEntryFromUsage returns cacheEntry if it exists in the cache
 func (cc *CacheCoherent) loadCacheEntryFromUsage(key any) (*cacheEntry, bool) {
-	var (
-		val any
-		yes bool
-	)
-
-	val, yes = cc.usageNormal.Load(key)
-	if !yes {
-		if val, yes = cc.usageSliding.Load(key); !yes {
-			return nil, false
-		}
+	if val, ok := cc.usageNormal.Load(key); ok {
+		return val.(*cacheEntry), true
 	}
 
-	return val.(*cacheEntry), true
+	if val, ok := cc.usageSliding.Load(key); ok {
+		return val.(*cacheEntry), true
+	}
+
+	return nil, false
 }
 
 func (cc *CacheCoherent) scanForExpiredItemsIfNeeded(nowUtc int64) {
-	if cc.expirationScanFrequency > nowUtc-cc.lastExpirationScan || cc.onScanForExpired.Swap(true) {
+	if cc.expirationScanFrequency > nowUtc-cc.lastExpirationScan {
 		return
 	}
 
-	cc.lastExpirationScan = nowUtc
-	robin.RightNow().Do(cc.flushExpired, nowUtc)
+	if cc.onScanForExpired.Swap(true) {
+		return
+	}
+
+	cc.flushExpired(nowUtc)
 }
 
 // flushExpired remove has expired item from the memory
 func (cc *CacheCoherent) flushExpired(nowUtc int64) {
+	var wg sync.WaitGroup
 	defer func() {
+		wg.Wait()
+		cc.lastExpirationScan = nowUtc
 		cc.onScanForExpired.Store(false)
 	}()
 
-	for loop := 0; loop < math.MaxInt32; loop++ {
-		cc.muForPriorityQueue.Lock()
-		ce, yes := cc.pq.dequeue(nowUtc)
-		cc.muForPriorityQueue.Unlock()
-		if !yes {
-			break
-		}
-		cc.excisionsC <- ce.key
-	}
+	wg.Add(1)
+	robin.RightNow().Do(func(nowUtc int64, wg *sync.WaitGroup) {
+		defer wg.Done()
+		cc.flushExpiredUsageNormal(nowUtc)
+	}, nowUtc, &wg)
 
+	wg.Add(1)
+	robin.RightNow().Do(func(nowUtc int64, wg *sync.WaitGroup) {
+		defer wg.Done()
+		cc.flushExpiredUsageSliding(nowUtc)
+	}, nowUtc, &wg)
+
+}
+
+func (cc *CacheCoherent) flushExpiredUsageNormal(nowUtc int64) {
+	excisionC := make(chan any, queueCapacity)
+	defer func() {
+		close(excisionC)
+	}()
+
+	robin.RightNow().Do(func(C <-chan any) {
+		for key := range C {
+			cc.usageNormal.Delete(key)
+		}
+	}, excisionC)
+
+	cc.muForPriorityQueue.Lock()
+	defer cc.muForPriorityQueue.Unlock()
+
+	l := cc.pq.Len()
+	for i := 0; i < l; i++ {
+		if ce, yes := cc.pq.dequeue(nowUtc); yes {
+			excisionC <- ce.key
+			continue
+		}
+
+		break
+	}
+}
+
+func (cc *CacheCoherent) flushExpiredUsageSliding(nowUtc int64) {
 	cc.usageSliding.Range(func(k, v any) bool {
-		ce := v.(*cacheEntry)
-		if ce.checkExpired(nowUtc) {
-			cc.usageSliding.Delete(ce.key)
+		if ce, ok := v.(*cacheEntry); ok {
+			if ce.checkExpired(nowUtc) {
+				cc.usageSliding.Delete(k)
+			}
 		}
 
 		return true
 	})
-}
-
-func (cc *CacheCoherent) consumeExcisions() {
-	for {
-		key := <-cc.excisionsC
-		cc.usageNormal.Delete(key)
-	}
 }
 
 func (cc *CacheCoherent) Statistics() CacheStatistics {

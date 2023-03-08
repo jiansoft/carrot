@@ -37,6 +37,7 @@ func main() {
 	log.Printf("memory.Have(%s) = %v", key1, memory.Have(key1))
 	log.Printf("carrot.Default.Have(%s) = %v", key1, carrot.Default.Have(key1))
 
+	// use carrot default instance
 	carrot.Default.Keep(key1, val, carrot.CacheEntryOptions{TimeToLive: time.Second})
 	log.Printf("carrot.Default.Have(%s) = %v", key1, carrot.Default.Have(key1))
 

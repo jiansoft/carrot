@@ -68,7 +68,7 @@ func Test_DataRace(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			tt.memoryCache.SetScanFrequency(time.Second)
 			wg := sync.WaitGroup{}
-			wg.Add(5)
+			wg.Add(1)
 			robin.RightNow().Do(func(loop int, m *CacheCoherent, swg *sync.WaitGroup) {
 				for i := 0; i < loop; i++ {
 					key := fmt.Sprintf("RightNow-1-%v", i)
@@ -76,7 +76,15 @@ func Test_DataRace(t *testing.T) {
 				}
 				swg.Done()
 			}, tt.loop, tt.memoryCache, &wg)
-
+			wg.Add(1)
+			robin.RightNow().Do(func(loop int, m *CacheCoherent, swg *sync.WaitGroup) {
+				for i := 0; i < loop; i++ {
+					key := fmt.Sprintf("RightNow-1-%v", i)
+					m.KeepDelayOrInactive(key, key, time.Hour, time.Second)
+				}
+				swg.Done()
+			}, tt.loop, tt.memoryCache, &wg)
+			wg.Add(1)
 			robin.RightNow().Do(func(loop int, m *CacheCoherent, swg *sync.WaitGroup) {
 				for i := 0; i < loop; i++ {
 					key := fmt.Sprintf("RightNow-1-%v", i)
@@ -84,7 +92,7 @@ func Test_DataRace(t *testing.T) {
 				}
 				swg.Done()
 			}, tt.loop, tt.memoryCache, &wg)
-
+			wg.Add(1)
 			robin.RightNow().Do(func(loop int, m *CacheCoherent, swg *sync.WaitGroup) {
 				for i := 0; i < loop; i++ {
 					key := fmt.Sprintf("RightNow-1-%v", i)
@@ -92,7 +100,7 @@ func Test_DataRace(t *testing.T) {
 				}
 				swg.Done()
 			}, tt.loop, Default, &wg)
-
+			wg.Add(1)
 			robin.RightNow().Do(func(loop int, m *CacheCoherent, swg *sync.WaitGroup) {
 				for i := 0; i < loop; i++ {
 					key := fmt.Sprintf("RightNow-1-%v", i)
@@ -105,7 +113,7 @@ func Test_DataRace(t *testing.T) {
 				}
 				swg.Done()
 			}, tt.loop, tt.memoryCache, &wg)
-
+			wg.Add(1)
 			robin.RightNow().Do(func(loop int, m *CacheCoherent, swg *sync.WaitGroup) {
 				for i := 0; i < loop; i++ {
 					tt.memoryCache.Reset()
@@ -161,8 +169,8 @@ func TestCacheCoherent_KeepDelayOrInactive(t *testing.T) {
 		val any
 	}
 	tests := []struct {
-		name string
 		args args
+		name string
 	}{
 		{name: "one", args: args{
 			key: "one",
@@ -243,6 +251,39 @@ func TestCacheCoherent_KeepDelayOrInactive(t *testing.T) {
 			if _, ok := cc.Read(tt.args.key); ok {
 				log.Fatalf("KeepDelayOrInactive inactive Fatal")
 			}
+		})
+	}
+}
+
+func Test_KeepSameKey(t *testing.T) {
+	type args struct {
+		key any
+	}
+	tests := []struct {
+		args args
+		name string
+	}{
+		{name: "one", args: args{
+			key: "one",
+		}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			//ttl
+			Default.KeepDelay(tt.args.key, "1", time.Hour)
+			if val, ok := Default.Read(tt.args.key); !ok {
+				equal(t, val, "1")
+			} else {
+				log.Printf("val:%v", val)
+			}
+			Default.KeepDelayOrInactive(tt.args.key, 2, time.Hour, time.Hour)
+			if val, ok := Default.Read(tt.args.key); !ok {
+				equal(t, val, 2)
+			} else {
+				log.Printf("val:%v", val)
+			}
+
 		})
 	}
 }

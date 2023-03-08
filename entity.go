@@ -77,9 +77,13 @@ func (ce *cacheEntry) setExpired(reason evictionReason) {
 	ce.isExpired = true
 }
 
-// checkExpired returns true if the item has expired .
+// checkExpired returns true if the item has expired (and set it to expire).
 func (ce *cacheEntry) checkExpired(utcNow int64) bool {
-	return ce.isExpired || ce.checkForExpiredTime(utcNow)
+	if ce.isExpired {
+		return true
+	}
+
+	return ce.checkForExpiredTime(utcNow)
 }
 
 // checkForExpiredTime returns true if the item has expired (and set it to expire).

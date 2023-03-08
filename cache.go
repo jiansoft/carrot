@@ -32,7 +32,6 @@ func erase(targets ...*sync.Map) {
 			return true
 		})
 	}
-
 }
 
 type parallelCount struct {
