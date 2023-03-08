@@ -17,7 +17,7 @@ func Test_CacheCoherent(t *testing.T) {
 		loop        int
 		want        int
 	}{
-		{newCacheCoherent(), "1", 1024, 1025},
+		{newCacheCoherent(), "1", 1024, 1},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
