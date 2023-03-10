@@ -304,15 +304,16 @@ func Test_SameData(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			m := newCacheCoherent()
-			//ttl
 			m.KeepDelay(tt.args.key, "one", time.Hour)
 			m.KeepDelay("2", "2", 10*time.Millisecond)
 			m.Forget(tt.args.key)
+
 			<-time.After(100 * time.Millisecond)
 
 			m.flushExpiredUsageNormal(time.Now().UnixNano())
-			if val, ok := Default.Read(tt.args.key); ok {
-				log.Fatal("val is not null ", val)
+
+			if val, ok := m.Read(tt.args.key); ok {
+				log.Fatalf("val is not null key:%v val:%v", tt.args.key, val)
 			}
 		})
 	}
