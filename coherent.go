@@ -15,17 +15,17 @@ type (
 	// CacheCoherent Wrapper for the memory cache entries collection.
 	CacheCoherent struct {
 		// excisionNormalC chan any
-		pq *priorityQueue
+		cpq *ConcurrentPriorityQueue
 		// save cache item.
 		usageNormal  sync.Map
 		usageSliding sync.Map
 		// prevent pq from data race
-		muForPriorityQueue sync.Mutex
-		stats              CacheStatistics
-		onScanForExpired   atomic.Bool
-		// how often to expiration scan all the cache
+		stats            CacheStatistics
+		onScanForExpired atomic.Bool
+		// the minimum length of time between successive scans for expired items.
 		expirationScanFrequency int64
-		lastExpirationScan      int64
+		// last expired item scan time(UnixNano)
+		lastExpirationScan int64
 	}
 )
 
@@ -35,9 +35,8 @@ func newCacheCoherent(capacity ...int) *CacheCoherent {
 	}
 
 	coherent := &CacheCoherent{
-		pq:    newPriorityQueue(queueCapacity),
-		stats: CacheStatistics{},
-		//excisionNormalC:         make(chan any, queueCapacity),
+		cpq:                     newConcurrentPriorityQueue(queueCapacity),
+		stats:                   CacheStatistics{},
 		lastExpirationScan:      time.Now().UTC().UnixNano(),
 		expirationScanFrequency: int64(time.Minute),
 	}
@@ -128,9 +127,7 @@ func (cc *CacheCoherent) Keep(key any, val any, option CacheEntryOptions) {
 			cc.usageSliding.Store(key, newEntry)
 		} else {
 			cc.usageNormal.Store(key, newEntry)
-			cc.muForPriorityQueue.Lock()
-			cc.pq.enqueue(newEntry)
-			cc.muForPriorityQueue.Unlock()
+			cc.cpq.enqueue(newEntry)
 		}
 	}
 
@@ -174,9 +171,7 @@ func (cc *CacheCoherent) forget(key any, nowUtc int64) {
 			cc.usageSliding.Delete(key)
 		} else {
 			cc.usageNormal.Delete(key)
-			cc.muForPriorityQueue.Lock()
-			cc.pq.update(ce)
-			cc.muForPriorityQueue.Unlock()
+			cc.cpq.update(ce)
 		}
 	}
 
@@ -186,9 +181,7 @@ func (cc *CacheCoherent) forget(key any, nowUtc int64) {
 // Reset removes all items from the memory
 func (cc *CacheCoherent) Reset() {
 	erase(&cc.usageNormal, &cc.usageSliding)
-	cc.muForPriorityQueue.Lock()
-	cc.pq.erase()
-	cc.muForPriorityQueue.Unlock()
+	cc.cpq.erase()
 	atomic.StoreInt64(&cc.stats.totalHits, 0)
 	atomic.StoreInt64(&cc.stats.totalMisses, 0)
 }
@@ -253,17 +246,16 @@ func (cc *CacheCoherent) flushExpiredUsageNormal(nowUtc int64) {
 		}
 	}, excisionC)
 
-	cc.muForPriorityQueue.Lock()
-	defer cc.muForPriorityQueue.Unlock()
-
-	l := cc.pq.Len()
+	l := cc.cpq.pq.Len()
 	for i := 0; i < l; i++ {
-		if ce, yes := cc.pq.dequeue(nowUtc); yes {
-			excisionC <- ce.key
-			continue
+		ce, yes := cc.cpq.dequeue(nowUtc)
+		if !yes {
+			break
 		}
 
-		break
+		if ce.evictionReason != removed {
+			excisionC <- ce.key
+		}
 	}
 }
 
@@ -282,8 +274,8 @@ func (cc *CacheCoherent) flushExpiredUsageSliding(nowUtc int64) {
 func (cc *CacheCoherent) Statistics() CacheStatistics {
 	sliding := &parallelCount{source: &cc.usageSliding}
 	normal := &parallelCount{source: &cc.usageNormal}
-	priorityQueueCount := cc.pq.Len()
-	parallelCountMap(normal, sliding)
+	priorityQueueCount := cc.cpq.pq.Len()
+	countMap(normal, sliding)
 
 	statistics := CacheStatistics{
 		usageSlidingEntryCount: sliding.count,

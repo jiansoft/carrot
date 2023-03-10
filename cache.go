@@ -39,7 +39,7 @@ type parallelCount struct {
 	count  int
 }
 
-func parallelCountMap(targets ...*parallelCount) {
+func countMap(targets ...*parallelCount) {
 	wg := sync.WaitGroup{}
 	for _, target := range targets {
 		wg.Add(1)

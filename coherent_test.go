@@ -287,3 +287,33 @@ func Test_KeepSameKey(t *testing.T) {
 		})
 	}
 }
+
+func Test_SameData(t *testing.T) {
+	type args struct {
+		key any
+	}
+	tests := []struct {
+		args args
+		name string
+	}{
+		{name: "one", args: args{
+			key: "one",
+		}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := newCacheCoherent()
+			//ttl
+			m.KeepDelay(tt.args.key, "one", time.Hour)
+			m.KeepDelay("2", "2", 10*time.Millisecond)
+			m.Forget(tt.args.key)
+			<-time.After(100 * time.Millisecond)
+
+			m.flushExpiredUsageNormal(time.Now().UnixNano())
+			if val, ok := Default.Read(tt.args.key); ok {
+				log.Fatal("val is not null ", val)
+			}
+		})
+	}
+}

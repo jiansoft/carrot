@@ -69,45 +69,7 @@ func (pq *priorityQueue) Pop() any {
 	return ce
 }
 
-func (pq *priorityQueue) enqueue(ce *cacheEntry) {
-	heap.Push(pq, ce)
-}
-
-func (pq *priorityQueue) dequeue(limit int64) (*cacheEntry, bool) {
-	if pq.isEmpty() {
-		return nil, false
-	}
-
-	ce := (*pq)[0]
-	if ce.priority > limit {
-		return nil, false
-	}
-
-	heap.Remove(pq, 0)
-
-	return ce, true
-}
-
-// update modifies the entity in the queue.
-func (pq *priorityQueue) update(ce *cacheEntry) {
-	heap.Fix(pq, ce.index)
-}
-
-// expired Set all entities to expire
-func (pq *priorityQueue) expired() {
-	n := pq.Len()
-	for i := 0; i < n; i++ {
-		(*pq)[i].setExpired(removed)
-	}
-}
-
-// erase removes all item
-func (pq *priorityQueue) erase() {
-	for !pq.isEmpty() {
-		heap.Remove(pq, 0)
-	}
-}
-
+// isEmpty returns true if the element amount is zero.
 func (pq *priorityQueue) isEmpty() bool {
 	return pq.Len() == 0
 }

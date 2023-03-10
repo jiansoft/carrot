@@ -1,7 +1,6 @@
 package carrot
 
 import (
-	"log"
 	"path/filepath"
 	"reflect"
 	"runtime"
@@ -30,7 +29,7 @@ func TestArray(t *testing.T) {
 	t.Logf("%v", result)
 }
 
-func Test_priorityQueue_expired(t *testing.T) {
+/*func Test_priorityQueue_expired(t *testing.T) {
 	tests := []struct {
 		pq   *priorityQueue
 		name string
@@ -82,4 +81,4 @@ func Test_priorityQueue_expired(t *testing.T) {
 			}
 		})
 	}
-}
+}*/
