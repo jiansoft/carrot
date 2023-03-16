@@ -7,7 +7,7 @@ import (
 
 type ConcurrentPriorityQueue struct {
 	pq *priorityQueue
-	mu sync.Mutex
+	mu *sync.Mutex
 }
 
 func newConcurrentPriorityQueue(capacity int) *ConcurrentPriorityQueue {
@@ -15,6 +15,7 @@ func newConcurrentPriorityQueue(capacity int) *ConcurrentPriorityQueue {
 	heap.Init(pq)
 	cpq := ConcurrentPriorityQueue{
 		pq: pq,
+		mu: new(sync.Mutex),
 	}
 	return &cpq
 }
@@ -37,6 +38,7 @@ func (cpq *ConcurrentPriorityQueue) dequeue(limit int64) (*cacheEntry, bool) {
 
 	ce := (*cpq.pq)[0]
 	if ce.priority > limit {
+
 		return nil, false
 	}
 
@@ -55,16 +57,19 @@ func (cpq *ConcurrentPriorityQueue) update(ce *cacheEntry) {
 // remove removes the element at index i from the heap.
 func (cpq *ConcurrentPriorityQueue) remove(ce *cacheEntry) {
 	cpq.mu.Lock()
+	defer cpq.mu.Unlock()
+
+	l := cpq.pq.Len()
+	if l == 0 || l <= ce.index || ce.index < 0 {
+		return
+	}
+
 	heap.Remove(cpq.pq, ce.index)
-	cpq.mu.Unlock()
 }
 
-// erase removes all elements
+// eraseMap removes all elements
 func (cpq *ConcurrentPriorityQueue) erase() {
 	cpq.mu.Lock()
-	l := cpq.pq.Len()
-	for i := 0; i < l; i++ {
-		heap.Pop(cpq.pq)
-	}
+	cpq.pq.clear()
 	cpq.mu.Unlock()
 }

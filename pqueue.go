@@ -1,10 +1,14 @@
 package carrot
 
+/*
+original from nsq https://github.com/nsqio/nsq/blob/master/internal/pqueue/pqueue.go
+*/
+
 import (
 	"container/heap"
 )
 
-// A priorityQueue implements heap.Interface and holds Items.
+// this is a priority queue as implemented by a min heap
 // the 0th element is the lowest value
 type priorityQueue []*cacheEntry
 
@@ -72,4 +76,8 @@ func (pq *priorityQueue) Pop() any {
 // isEmpty returns true if the element amount is zero.
 func (pq *priorityQueue) isEmpty() bool {
 	return pq.Len() == 0
+}
+
+func (pq *priorityQueue) clear() {
+	*pq = (*pq)[:0]
 }

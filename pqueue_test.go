@@ -1,6 +1,7 @@
 package carrot
 
 import (
+	"container/heap"
 	"path/filepath"
 	"reflect"
 	"runtime"
@@ -29,7 +30,7 @@ func TestArray(t *testing.T) {
 	t.Logf("%v", result)
 }
 
-/*func Test_priorityQueue_expired(t *testing.T) {
+func Test_PriorityQueue(t *testing.T) {
 	tests := []struct {
 		pq   *priorityQueue
 		name string
@@ -38,47 +39,17 @@ func TestArray(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			var newEntity *cacheEntry
+			heap.Push(tt.pq, &cacheEntry{key: 4, value: 4, created: 4, lastAccessed: 4, absoluteExpiration: 4, priority: 4})
+			heap.Push(tt.pq, &cacheEntry{key: 2, value: 2, created: 2, lastAccessed: 2, absoluteExpiration: 2, priority: 2})
+			heap.Push(tt.pq, &cacheEntry{key: 1, value: 1, created: 1, lastAccessed: 1, absoluteExpiration: 1, priority: 1})
+			heap.Push(tt.pq, &cacheEntry{key: 3, value: 3, created: 3, lastAccessed: 3, absoluteExpiration: 3, priority: 3})
 
-			newEntity = &cacheEntry{key: 1, value: 1, created: 1, lastAccessed: 1, absoluteExpiration: 1, priority: 1}
-			tt.pq.enqueue(newEntity)
-			newEntity = &cacheEntry{key: 3, value: 3, created: 3, lastAccessed: 3, absoluteExpiration: 3, priority: 3}
-			tt.pq.enqueue(newEntity)
-			newEntity = &cacheEntry{key: 2, value: 2, created: 2, lastAccessed: 2, absoluteExpiration: 2, priority: 2}
-			tt.pq.enqueue(newEntity)
-
-			var loop = 1
-			for {
-				item, ok := tt.pq.dequeue(2)
-				if !ok {
-					break
-				}
-				if item.key != loop {
-					log.Fatalf("error loop:%v key:%v loop and key didn't match", loop, item.key)
-				}
-				log.Printf("dequeue:%+v", item)
-				loop++
-			}
-
-			tt.pq.dequeue(3)
-
-			*tt.pq = append(*tt.pq,
-				&cacheEntry{key: 1, value: 1, created: 1, lastAccessed: 1, absoluteExpiration: 1, priority: 1},
-				&cacheEntry{key: 3, value: 3, created: 3, lastAccessed: 3, absoluteExpiration: 3, priority: 3},
-				&cacheEntry{key: 2, value: 2, created: 2, lastAccessed: 2, absoluteExpiration: 2, priority: 2})
-			tt.pq.expired()
-			loop = 1
-			for {
-				item, ok := tt.pq.dequeue(2)
-				if !ok {
-					break
-				}
-				if item.key != loop {
-					log.Fatalf("error loop:%v key:%v loop and key didn't match", loop, item.key)
-				}
-				log.Printf("dequeue:%+v", item)
-				loop++
+			lastPriority := heap.Pop(tt.pq).(*cacheEntry).priority
+			for i := 0; i < 3; i++ {
+				item := heap.Pop(tt.pq)
+				equal(t, lastPriority < item.(*cacheEntry).priority, true)
+				lastPriority = item.(*cacheEntry).priority
 			}
 		})
 	}
-}*/
+}

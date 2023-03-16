@@ -18,9 +18,9 @@ func main() {
 	//change expired scan frequency to one second(default one minute)
 	memory.SetScanFrequency(time.Second)
 	// key1 just lives for one second
-	memory.KeepDelay(key1, val, time.Second)
+	memory.Delay(key1, val, time.Second)
 	// key2 is never expired(because param ttl is negative)
-	memory.KeepDelay(key2, val, -time.Second)
+	memory.Delay(key2, val, -time.Second)
 
 	robin.Delay(1).Seconds().Do(func() {
 		log.Printf("Is memory().%s alive => %v", key1, memory.Have(key1))
@@ -38,7 +38,7 @@ func main() {
 	log.Printf("carrot.Default.Have(%s) = %v", key1, carrot.Default.Have(key1))
 
 	// use carrot default instance
-	carrot.Default.Keep(key1, val, carrot.CacheEntryOptions{TimeToLive: time.Second})
+	carrot.Default.Forever(key1, val)
 	log.Printf("carrot.Default.Have(%s) = %v", key1, carrot.Default.Have(key1))
 
 	v, ok = carrot.Default.Read(key1)
@@ -48,11 +48,11 @@ func main() {
 	log.Printf("carrot.Default.Have(%s) = %v", key1, carrot.Default.Have(key1))
 
 	robin.Every(9).Seconds().Do(func() {
-		//memory.Keep(time.Now().Format("05"), val, carrot.CacheEntryOptions{TimeToLive: time.Second})
+		//memory.Forever(time.Now().Format("05"), val, carrot.CacheEntryOptions{TimeToLive: time.Second})
 		ttlKey := "ttl" + time.Now().Format("05")
-		memory.Keep(ttlKey, val, carrot.CacheEntryOptions{TimeToLive: 10 * time.Second})
+		memory.Delay(ttlKey, val, 10*time.Second)
 		inactiveKey := "inactive" + time.Now().Format("05")
-		memory.Keep(inactiveKey, val, carrot.CacheEntryOptions{TimeToLive: -time.Second, SlidingExpiration: 10 * time.Second})
+		memory.Inactive(inactiveKey, val, 10*time.Second)
 	})
 	robin.Every(10).Seconds().Do(func() {
 		state := memory.Statistics()

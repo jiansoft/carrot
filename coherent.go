@@ -9,22 +9,20 @@ import (
 	"github.com/jiansoft/robin"
 )
 
-var queueCapacity = 2048
+var queueCapacity = 512
 
 type (
 	// CacheCoherent Wrapper for the memory cache entries collection.
 	CacheCoherent struct {
-		// excisionNormalC chan any
 		cpq *ConcurrentPriorityQueue
-		// save cache item.
-		usageNormal  sync.Map
-		usageSliding sync.Map
-		// prevent pq from data race
-		stats            CacheStatistics
+		// save cache entry.
+		usage sync.Map
+		stats CacheStatistics
+		// currently in the state of scanning for expired.
 		onScanForExpired atomic.Bool
 		// the minimum length of time between successive scans for expired items.
-		expirationScanFrequency int64
-		// last expired item scan time(UnixNano)
+		expirationScanFrequency time.Duration
+		// last expired scanning time(UnixNano)
 		lastExpirationScan int64
 	}
 )
@@ -38,71 +36,83 @@ func newCacheCoherent(capacity ...int) *CacheCoherent {
 		cpq:                     newConcurrentPriorityQueue(queueCapacity),
 		stats:                   CacheStatistics{},
 		lastExpirationScan:      time.Now().UTC().UnixNano(),
-		expirationScanFrequency: int64(time.Minute),
+		expirationScanFrequency: time.Minute,
 	}
 
 	return coherent
 }
 
 // SetScanFrequency sets a new frequency value
-func (cc *CacheCoherent) SetScanFrequency(frequency time.Duration) {
-	cc.expirationScanFrequency = int64(frequency)
+func (cc *CacheCoherent) SetScanFrequency(frequency time.Duration) bool {
+	if frequency <= 0 {
+		return false
+	}
+
+	cc.expirationScanFrequency = frequency
+
+	return true
 }
 
-// KeepForever never expiration
-func (cc *CacheCoherent) KeepForever(key, val any) {
-	cc.KeepForeverButInactive(key, val, time.Duration(0))
+// Forever never expiration
+func (cc *CacheCoherent) Forever(key, val any) {
+	cc.keep(key, val, CacheEntryOptions{TimeToLive: -time.Duration(1)})
 }
 
-// KeepForeverButInactive never expiration but it can't be inactive for more than a period of time
-func (cc *CacheCoherent) KeepForeverButInactive(key, val any, inactive time.Duration) {
-	cc.KeepDelayOrInactive(key, val, -time.Duration(1), inactive)
-}
-
-// KeepUntil until when does it expire e.g. 2023-01-01 12:31:59.999
-func (cc *CacheCoherent) KeepUntil(key, val any, until time.Time) {
-	cc.KeepUntilOrInactive(key, val, until, time.Duration(0))
-}
-
-// KeepUntilOrInactive until a certain time does it expire, or it can't be inactive for more than a period of time e.g. 2023-01-01 12:31:59.999
-func (cc *CacheCoherent) KeepUntilOrInactive(key, val any, until time.Time, inactive time.Duration) {
+// Until expires at a certain time. e.g. 2023-01-01 12:31:59.999
+func (cc *CacheCoherent) Until(key, val any, until time.Time) {
 	var (
 		untilUtc = until.UTC()
 		nowUtc   = time.Now().UTC()
-		ttl      = nowUtc.Sub(untilUtc)
+		ttl      = untilUtc.Sub(nowUtc)
 	)
 
-	cc.KeepDelayOrInactive(key, val, ttl, inactive)
+	cc.Delay(key, val, ttl)
 }
 
-// KeepDelay expires after a period of time. e.g. time.Hour  it's expired after one hour from now
-func (cc *CacheCoherent) KeepDelay(key, val any, ttl time.Duration) {
-	cc.KeepDelayOrInactive(key, val, ttl, time.Duration(0))
-}
-
-// KeepDelayOrInactive expires after a period of time, or it can't be inactive for more than a period of time
-func (cc *CacheCoherent) KeepDelayOrInactive(key, val any, ttl, inactive time.Duration) {
-	cc.Keep(key, val, CacheEntryOptions{TimeToLive: ttl, SlidingExpiration: inactive})
-}
-
-// Keep inserts an item into the memory
-func (cc *CacheCoherent) Keep(key any, val any, option CacheEntryOptions) {
-	if option.TimeToLive == 0 || option.SlidingExpiration < 0 {
+// Delay expires after a period of time. e.g. time.Hour, it will expire after one hour from now
+func (cc *CacheCoherent) Delay(key, val any, ttl time.Duration) {
+	if ttl <= 0 {
 		return
 	}
 
+	cc.keep(key, val, CacheEntryOptions{TimeToLive: ttl})
+}
+
+// Inactive expires after it is inactive for more than a period of time
+func (cc *CacheCoherent) Inactive(key, val any, inactive time.Duration) {
+	if inactive <= 0 {
+		return
+	}
+
+	cc.keep(key, val, CacheEntryOptions{SlidingExpiration: inactive})
+}
+
+// Forever inserts an item into the memory
+func (cc *CacheCoherent) keep(key any, val any, option CacheEntryOptions) {
 	var (
-		// default is never expiration
-		utcAbsExp = int64(-1)
-		// default is the highest
-		priority = int64(math.MaxInt64)
-		nowUtc   = time.Now().UTC().UnixNano()
-		ttl      = option.TimeToLive.Nanoseconds()
+		nowUtc    = time.Now().UTC().UnixNano()
+		ttl       = option.TimeToLive.Nanoseconds()
+		priority  int64
+		utcAbsExp int64
+		kind      cacheKind
 	)
 
-	if ttl > utcAbsExp {
-		utcAbsExp = nowUtc + ttl
+	if option.SlidingExpiration > 0 {
+		//滑動首次的到期時間為 now + SlidingExpiration
+		utcAbsExp = nowUtc + option.SlidingExpiration.Nanoseconds()
 		priority = utcAbsExp
+		kind = KindSliding
+	} else {
+		//永不過期 ttl 為 -1
+		if ttl > 0 {
+			utcAbsExp = nowUtc + ttl
+			priority = utcAbsExp
+		} else {
+			// 永不到期
+			utcAbsExp = -1
+			priority = int64(math.MaxInt64)
+		}
+		kind = KindNormal
 	}
 
 	newEntry := &cacheEntry{
@@ -112,23 +122,25 @@ func (cc *CacheCoherent) Keep(key any, val any, option CacheEntryOptions) {
 		created:            nowUtc,
 		lastAccessed:       nowUtc,
 		absoluteExpiration: utcAbsExp,
+		slidingExpiration:  option.SlidingExpiration,
+		kind:               kind,
 	}
 
-	// inactive的時效只能為正數
-	if option.SlidingExpiration > 0 {
-		newEntry.slidingExpiration = int64(option.SlidingExpiration)
+	priorEntry, priorExist := cc.loadCacheEntryFromUsage(key)
+	if priorExist {
+		priorEntry.setExpired(replaced)
+		cc.cpq.remove(priorEntry)
 	}
 
-	cc.forget(key, nowUtc)
-
-	if !newEntry.checkExpired(nowUtc) {
-		if newEntry.isSlidingTypeCache() {
-			// 如果有設定inactive時效時要改放在 usageSliding ，降低 map range 時鎖定的時間
-			cc.usageSliding.Store(key, newEntry)
-		} else {
-			cc.usageNormal.Store(key, newEntry)
-			cc.cpq.enqueue(newEntry)
+	if newEntry.checkExpired(nowUtc) {
+		// already expired
+		if priorExist {
+			cc.usage.Delete(key)
 		}
+	} else {
+		// Try to add or update the new entry.
+		cc.usage.Store(key, newEntry)
+		cc.cpq.enqueue(newEntry)
 	}
 
 	cc.scanForExpiredItemsIfNeeded(nowUtc)
@@ -141,6 +153,13 @@ func (cc *CacheCoherent) Read(key any) (any, bool) {
 		if !ce.checkExpired(nowUtc) {
 			atomic.AddInt64(&cc.stats.totalHits, 1)
 			ce.lastAccessed = nowUtc
+
+			if ce.isSliding() {
+				ce.absoluteExpiration = nowUtc + ce.slidingExpiration.Nanoseconds()
+				ce.priority = ce.absoluteExpiration
+				cc.cpq.update(ce)
+			}
+
 			cc.scanForExpiredItemsIfNeeded(nowUtc)
 			return ce.value, true
 		}
@@ -167,12 +186,8 @@ func (cc *CacheCoherent) Forget(key any) {
 func (cc *CacheCoherent) forget(key any, nowUtc int64) {
 	if ce, exist := cc.loadCacheEntryFromUsage(key); exist {
 		ce.setExpired(removed)
-		if ce.isSlidingTypeCache() {
-			cc.usageSliding.Delete(key)
-		} else {
-			cc.usageNormal.Delete(key)
-			cc.cpq.update(ce)
-		}
+		cc.usage.Delete(key)
+		cc.cpq.remove(ce)
 	}
 
 	cc.scanForExpiredItemsIfNeeded(nowUtc)
@@ -180,7 +195,7 @@ func (cc *CacheCoherent) forget(key any, nowUtc int64) {
 
 // Reset removes all items from the memory
 func (cc *CacheCoherent) Reset() {
-	erase(&cc.usageNormal, &cc.usageSliding)
+	eraseMap(&cc.usage)
 	cc.cpq.erase()
 	atomic.StoreInt64(&cc.stats.totalHits, 0)
 	atomic.StoreInt64(&cc.stats.totalMisses, 0)
@@ -188,11 +203,7 @@ func (cc *CacheCoherent) Reset() {
 
 // loadCacheEntryFromUsage returns cacheEntry if it exists in the cache
 func (cc *CacheCoherent) loadCacheEntryFromUsage(key any) (*cacheEntry, bool) {
-	if val, ok := cc.usageNormal.Load(key); ok {
-		return val.(*cacheEntry), true
-	}
-
-	if val, ok := cc.usageSliding.Load(key); ok {
+	if val, ok := cc.usage.Load(key); ok {
 		return val.(*cacheEntry), true
 	}
 
@@ -200,7 +211,7 @@ func (cc *CacheCoherent) loadCacheEntryFromUsage(key any) (*cacheEntry, bool) {
 }
 
 func (cc *CacheCoherent) scanForExpiredItemsIfNeeded(nowUtc int64) {
-	if cc.expirationScanFrequency > nowUtc-cc.lastExpirationScan {
+	if cc.expirationScanFrequency > time.Duration(nowUtc-cc.lastExpirationScan) {
 		return
 	}
 
@@ -208,81 +219,40 @@ func (cc *CacheCoherent) scanForExpiredItemsIfNeeded(nowUtc int64) {
 		return
 	}
 
-	cc.flushExpired(nowUtc)
+	robin.RightNow().Do(cc.flushExpired, nowUtc)
 }
 
 // flushExpired remove has expired item from the memory
 func (cc *CacheCoherent) flushExpired(nowUtc int64) {
-	var wg sync.WaitGroup
 	defer func() {
-		wg.Wait()
 		cc.lastExpirationScan = nowUtc
 		cc.onScanForExpired.Store(false)
 	}()
 
-	wg.Add(1)
-	robin.RightNow().Do(func(nowUtc int64, wg *sync.WaitGroup) {
-		defer wg.Done()
-		cc.flushExpiredUsageNormal(nowUtc)
-	}, nowUtc, &wg)
-
-	wg.Add(1)
-	robin.RightNow().Do(func(nowUtc int64, wg *sync.WaitGroup) {
-		defer wg.Done()
-		cc.flushExpiredUsageSliding(nowUtc)
-	}, nowUtc, &wg)
-
-}
-
-func (cc *CacheCoherent) flushExpiredUsageNormal(nowUtc int64) {
-	excisionC := make(chan any, queueCapacity)
-	defer func() {
-		close(excisionC)
-	}()
-
-	robin.RightNow().Do(func(C <-chan any) {
-		for key := range C {
-			cc.usageNormal.Delete(key)
-		}
-	}, excisionC)
-
-	l := cc.cpq.pq.Len()
-	for i := 0; i < l; i++ {
+	loop := cc.cpq.pq.Len()
+	for i := 0; i < loop; i++ {
 		ce, yes := cc.cpq.dequeue(nowUtc)
 		if !yes {
 			break
 		}
 
-		if ce.evictionReason != removed {
-			excisionC <- ce.key
-		}
+		//if ce.evictionReason != removed {
+		//fmt.Printf("Delete(%s) %+v\n",ce.key,ce)
+		cc.usage.Delete(ce.key)
+		//}
 	}
 }
 
-func (cc *CacheCoherent) flushExpiredUsageSliding(nowUtc int64) {
-	cc.usageSliding.Range(func(k, v any) bool {
-		if ce, ok := v.(*cacheEntry); ok {
-			if ce.checkExpired(nowUtc) {
-				cc.usageSliding.Delete(k)
-			}
-		}
-
-		return true
-	})
-}
-
 func (cc *CacheCoherent) Statistics() CacheStatistics {
-	sliding := &parallelCount{source: &cc.usageSliding}
-	normal := &parallelCount{source: &cc.usageNormal}
+	normal := &parallelCount{source: &cc.usage}
 	priorityQueueCount := cc.cpq.pq.Len()
-	countMap(normal, sliding)
+	countMap(normal)
 
 	statistics := CacheStatistics{
-		usageSlidingEntryCount: sliding.count,
-		usageNormalEntryCount:  normal.count,
-		priorityQueueCount:     priorityQueueCount,
-		totalMisses:            atomic.LoadInt64(&cc.stats.totalMisses),
-		totalHits:              atomic.LoadInt64(&cc.stats.totalHits),
+		usageCount:  normal.count,
+		pqCount:     priorityQueueCount,
+		totalMisses: atomic.LoadInt64(&cc.stats.totalMisses),
+		totalHits:   atomic.LoadInt64(&cc.stats.totalHits),
 	}
 
 	return statistics

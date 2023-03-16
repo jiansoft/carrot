@@ -17,20 +17,27 @@ const (
 )
 
 const (
-	Low CachePriority = iota
-	Normal
-	High
-	NeverRemove
+	PriorityLow CachePriority = iota
+	PriorityNormal
+	PriorityHigh
+	PriorityNeverRemove
+)
+
+const (
+	KindSliding cacheKind = iota
+	KindNormal
 )
 
 type (
 	evictionReason int
 	CachePriority  int
+	cacheKind      int
 
 	cacheEntry struct {
 		key            any
 		value          any
 		evictionReason evictionReason
+		kind           cacheKind
 		// created time (unix nanoseconds)
 		created int64
 		// lives at this point in time. (unix nanoseconds)
@@ -40,7 +47,7 @@ type (
 		// for sliding scan use
 		lastAccessed int64
 		// how long a cache entry can be inactive (e.g. not accessed). **only positive**
-		slidingExpiration int64
+		slidingExpiration time.Duration
 		// for PriorityQueue use
 		index int
 		// is it expired
@@ -49,7 +56,8 @@ type (
 
 	CacheEntryOptions struct {
 		Size int64
-		// how long to live e.g. 5 minutes after now
+		// This is the time to live, e.g. 5 minutes from now. A negative value means forever.
+		// TimeToLive and SlidingExpiration can only choose one to set  if both are set, SlidingExpiration will take precedence.
 		TimeToLive time.Duration
 		// how long a cache entry can be inactive (e.g. not accessed). **only positive**
 		SlidingExpiration time.Duration
@@ -57,14 +65,9 @@ type (
 	}
 )
 
-// isSlidingTypeCache returns true if the cache is sliding type
-func (ce *cacheEntry) isSlidingTypeCache() bool {
-	return ce.slidingExpiration > 0
-}
-
-// isSlidingTypeCache returns true if the cache is never expired
-func (ce *cacheEntry) isNeverExpired() bool {
-	return ce.absoluteExpiration < 0
+// isSliding returns true if the cache is sliding kind
+func (ce *cacheEntry) isSliding() bool {
+	return ce.kind == KindSliding
 }
 
 // setExpired Sets the entity expired
@@ -93,7 +96,7 @@ func (ce *cacheEntry) checkForExpiredTime(utcNow int64) bool {
 		return false
 	}
 
-	if ce.isSlidingTypeCache() && (utcNow-ce.lastAccessed) >= ce.slidingExpiration {
+	if ce.isSliding() && ce.slidingExpiration < time.Duration(utcNow-ce.lastAccessed) {
 		ce.setExpired(expired)
 		return true
 	}

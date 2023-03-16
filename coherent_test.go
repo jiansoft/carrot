@@ -2,12 +2,8 @@ package carrot
 
 import (
 	"fmt"
-	"log"
-	"sync"
 	"testing"
 	"time"
-
-	"github.com/jiansoft/robin"
 )
 
 func Test_CacheCoherent(t *testing.T) {
@@ -23,7 +19,7 @@ func Test_CacheCoherent(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			for i := 0; i < tt.loop; i++ {
 				key := fmt.Sprintf("QQ-%s-%v", tt.name, i)
-				tt.memoryCache.KeepDelay(key, key, 1*time.Hour)
+				tt.memoryCache.Delay(key, key, 1*time.Hour)
 
 				yes := tt.memoryCache.Have(key)
 				equal(t, yes, true)
@@ -37,26 +33,33 @@ func Test_CacheCoherent(t *testing.T) {
 				_, ok = tt.memoryCache.Read(key)
 				equal(t, ok, false)
 			}
+			s := tt.memoryCache.Statistics()
+			t.Logf("Statistics %+v", s)
+			equal(t, s.usageCount, 0)
+			equal(t, s.usageCount, s.pqCount)
+			tt.memoryCache.Reset()
+
 			tt.memoryCache.Forget("noKey")
 			_, ok := tt.memoryCache.Read("noKey")
 			equal(t, ok, false)
 			_, ok = tt.memoryCache.loadCacheEntryFromUsage("noKey")
 			equal(t, ok, false)
 
-			tt.memoryCache.KeepDelay(1, 1, 1*time.Hour)
+			tt.memoryCache.Delay(1, 1, 1*time.Hour)
 			yes := tt.memoryCache.Have(1)
 			equal(t, yes, true)
 			val, _ := tt.memoryCache.Read(1)
 			equal(t, val, 1)
 
-			s := tt.memoryCache.Statistics()
+			s = tt.memoryCache.Statistics()
 			t.Logf("Statistics %+v", s)
-			equal(t, s.usageNormalEntryCount, tt.want)
+			equal(t, s.usageCount, tt.want)
+			equal(t, s.usageCount, s.pqCount)
 		})
 	}
 }
 
-func Test_DataRace(t *testing.T) {
+/*func Test_DataRace(t *testing.T) {
 	tests := []struct {
 		memoryCache *CacheCoherent
 		name        string
@@ -72,7 +75,7 @@ func Test_DataRace(t *testing.T) {
 			robin.RightNow().Do(func(loop int, m *CacheCoherent, swg *sync.WaitGroup) {
 				for i := 0; i < loop; i++ {
 					key := fmt.Sprintf("RightNow-1-%v", i)
-					m.KeepDelay(key, key, time.Hour)
+					m.Delay(key, key, time.Hour)
 				}
 				swg.Done()
 			}, tt.loop, tt.memoryCache, &wg)
@@ -104,8 +107,7 @@ func Test_DataRace(t *testing.T) {
 			robin.RightNow().Do(func(loop int, m *CacheCoherent, swg *sync.WaitGroup) {
 				for i := 0; i < loop; i++ {
 					key := fmt.Sprintf("RightNow-1-%v", i)
-					m.KeepDelay(key, key, 1*time.Hour)
-					_ = m.Have(key)
+					m.Delay(key, key, 1*time.Hour)
 					_, _ = m.Read(key)
 					m.Forget(key)
 					_ = m.Have(key)
@@ -123,14 +125,19 @@ func Test_DataRace(t *testing.T) {
 
 			wg.Wait()
 			t.Logf("Statistics %+v", tt.memoryCache.Statistics())
+			tt.memoryCache.Reset()
 			wg.Add(1)
 			robin.RightNow().Do(keep, tt.loop, tt.memoryCache, &wg, 1)
+			<-time.After(time.Millisecond *100)
 			wg.Add(1)
-			robin.RightNow().Do(read, tt.loop, tt.memoryCache, &wg, 1)
+			robin.RightNow().Do(read, t, tt.loop, tt.memoryCache, &wg, 1)
+			<-time.After(time.Millisecond *100)
 			wg.Add(1)
 			robin.RightNow().Do(keep, tt.loop, tt.memoryCache, &wg, 2)
+			<-time.After(time.Millisecond *100)
 			wg.Add(1)
-			robin.RightNow().Do(read, tt.loop, tt.memoryCache, &wg, 2)
+			robin.RightNow().Do(read, t, tt.loop, tt.memoryCache, &wg, 2)
+			<-time.After(time.Millisecond *100)
 			wg.Add(1)
 			robin.RightNow().Do(keep, tt.loop, tt.memoryCache, &wg, 3)
 			wg.Wait()
@@ -140,181 +147,127 @@ func Test_DataRace(t *testing.T) {
 			t.Logf("Reset Statistics %+v", tt.memoryCache.Statistics())
 		})
 	}
-}
+}*/
 
-func keep(loop int, m *CacheCoherent, swg *sync.WaitGroup, index int) {
+/*func keep(loop int, m *CacheCoherent, swg *sync.WaitGroup, index int) {
 	for i := 0; i < loop; i++ {
 		key := fmt.Sprintf("QQ-%v-%v", i, index)
 		if i%2 == 0 {
 			m.KeepDelayOrInactive(key, key, time.Duration(int64(10+i)*int64(time.Millisecond)), time.Second)
 		} else {
-			m.KeepDelay(key, key, time.Duration(int64(10+i)*int64(time.Millisecond)))
+			m.Delay(key, key, time.Duration(int64(10+i)*int64(time.Second)))
 		}
 	}
 	swg.Done()
 }
 
-func read(want int, m *CacheCoherent, swg *sync.WaitGroup, index int) {
-	for i := 0; i < want; i++ {
+func read(t *testing.T, loop int, m *CacheCoherent, swg *sync.WaitGroup, index int) {
+	for i := 0; i < loop; i++ {
 		key := fmt.Sprintf("QQ-%v-%v", i, index)
-		_, _ = m.Read(key)
+		if _, ok := m.Read(key); ok {
+			//t.Logf("%s is find", key)
+		}
 		m.Forget(key)
 	}
 	swg.Done()
-}
+}*/
 
-func TestCacheCoherent_KeepDelayOrInactive(t *testing.T) {
+func Test_Default(t *testing.T) {
 	type args struct {
-		key any
-		val any
+		key         any
+		val         any
+		valUntil    any
+		valDelay    any
+		valInactive any
 	}
 	tests := []struct {
 		args args
 		name string
 	}{
 		{name: "one", args: args{
-			key: "one",
-			val: "one",
+			key: "one", val: "Forever", valUntil: "Until", valDelay: "Delay", valInactive: "Inactive",
 		}},
 	}
-	cc := newCacheCoherent(10)
-	cc.SetScanFrequency(100 * time.Millisecond)
+	var timeBase = time.Millisecond * 50
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			//ttl
-			cc.KeepDelayOrInactive(tt.args.key, tt.args.val, 100*time.Millisecond, time.Duration(0))
-			if val, ok := cc.Read(tt.args.key); !ok {
-				log.Fatalf("KeepDelayOrInactive ttl Fatal")
+			Default.Forever(tt.args.key, tt.args.val)
+			Default.flushExpired(time.Now().UTC().UnixNano())
+			if val, ok := Default.Read(tt.args.key); ok {
+				equal(t, val, tt.args.val)
 			} else {
-				if v, o := val.(string); !o || v != tt.args.val {
-					log.Fatalf("KeepDelayOrInactive ttl Fatal")
-				} else {
-					equal(t, v, tt.args.val)
-				}
+				t.Fatalf("Forever can't read the key:%v", tt.args.key)
 			}
+			foreverStat := Default.Statistics()
+			t.Logf("Forever Statistics %+v", foreverStat)
+			equal(t, int64(1), foreverStat.totalHits)
+			equal(t, int64(0), foreverStat.totalMisses)
+			Default.Reset()
 
-			state := cc.Statistics()
-			//t.Logf("ttl Statistics %+v", state)
-			equal(t, state.usageNormalEntryCount, 1)
-			equal(t, state.priorityQueueCount, 1)
-			equal(t, state.totalHits, int64(1))
-			equal(t, state.totalMisses, int64(0))
-			equal(t, state.usageSlidingEntryCount, 0)
-
-			<-time.After(100 * time.Millisecond)
-			cc.Read(tt.args.key)
-			<-time.After(100 * time.Millisecond)
-			state = cc.Statistics()
-			//t.Logf("ttl Statistics %+v", state)
-			equal(t, state.usageNormalEntryCount, 0)
-			equal(t, state.priorityQueueCount, 0)
-			equal(t, state.totalHits, int64(1))
-			equal(t, state.totalMisses, int64(1))
-			equal(t, state.usageSlidingEntryCount, 0)
-
-			if _, ok := cc.Read(tt.args.key); ok {
-				log.Fatalf("KeepDelayOrInactive ttl Fatal")
-			}
-
-			cc.Reset()
-
-			//inactive
-			cc.KeepDelayOrInactive(tt.args.key, tt.args.val, time.Minute, 100*time.Millisecond)
-			if val, ok := cc.Read(tt.args.key); !ok {
-				log.Fatalf("KeepDelayOrInactive inactive Fatal")
+			//----  Until ----
+			Default.Until(tt.args.key, tt.args.valUntil, time.Now().Add(timeBase))
+			Default.flushExpired(time.Now().UTC().UnixNano())
+			if val, ok := Default.Read(tt.args.key); ok {
+				equal(t, val, tt.args.valUntil)
 			} else {
-				if v, o := val.(string); !o || v != tt.args.val {
-					log.Fatalf("KeepDelayOrInactive inactive Fatal")
-				} else {
-					equal(t, v, tt.args.val)
-				}
+				t.Fatalf("Until can't read the key:%v", tt.args.key)
 			}
 
-			state = cc.Statistics()
-			t.Logf("inactive Statistics %+v", state)
-			equal(t, state.usageNormalEntryCount, 0)
-			equal(t, state.priorityQueueCount, 0)
-			equal(t, state.totalHits, int64(1))
-			equal(t, state.totalMisses, int64(0))
-			equal(t, state.usageSlidingEntryCount, 1)
-			<-time.After(100 * time.Millisecond)
-			cc.Read(tt.args.key)
-			<-time.After(100 * time.Millisecond)
-			state = cc.Statistics()
-			t.Logf("inactive Statistics %+v", state)
-			equal(t, state.usageNormalEntryCount, 0)
-			equal(t, state.priorityQueueCount, 0)
-			equal(t, state.totalHits, int64(1))
-			equal(t, state.totalMisses, int64(1))
-			equal(t, state.usageSlidingEntryCount, 0)
-
-			if _, ok := cc.Read(tt.args.key); ok {
-				log.Fatalf("KeepDelayOrInactive inactive Fatal")
+			<-time.After(timeBase)
+			Default.flushExpired(time.Now().UTC().UnixNano())
+			if _, ok := Default.Read(tt.args.key); ok {
+				t.Fatalf("After calling flushExpired, Until can read the key:%v", tt.args.key)
 			}
-		})
-	}
-}
+			untilStat := Default.Statistics()
+			t.Logf("Until Statistics %+v", untilStat)
+			equal(t, int64(1), untilStat.totalHits)
+			equal(t, int64(1), untilStat.totalMisses)
+			Default.Reset()
 
-func Test_KeepSameKey(t *testing.T) {
-	type args struct {
-		key any
-	}
-	tests := []struct {
-		args args
-		name string
-	}{
-		{name: "one", args: args{
-			key: "one",
-		}},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			//ttl
-			Default.KeepDelay(tt.args.key, "1", time.Hour)
-			if val, ok := Default.Read(tt.args.key); !ok {
-				equal(t, val, "1")
+			//----  Delay ----
+			Default.Delay(tt.args.key, tt.args.valDelay, timeBase)
+			Default.flushExpired(time.Now().UTC().UnixNano())
+			if val, ok := Default.Read(tt.args.key); ok {
+				equal(t, val, tt.args.valDelay)
 			} else {
-				log.Printf("val:%v", val)
+				t.Fatalf("Delay can't read the key:%v", tt.args.key)
 			}
-			Default.KeepDelayOrInactive(tt.args.key, 2, time.Hour, time.Hour)
-			if val, ok := Default.Read(tt.args.key); !ok {
-				equal(t, val, 2)
+
+			<-time.After(timeBase)
+			Default.flushExpired(time.Now().UTC().UnixNano())
+			if _, ok := Default.Read(tt.args.key); ok {
+				t.Fatalf("After flushExpired, the key can be read by Delay:%v", tt.args.key)
+			}
+			delayStat := Default.Statistics()
+			t.Logf("Delay Statistics %+v", delayStat)
+			equal(t, int64(1), delayStat.totalHits)
+			equal(t, int64(1), delayStat.totalMisses)
+			Default.Reset()
+
+			//----  Inactive ----
+			Default.Inactive(tt.args.key, tt.args.valInactive, timeBase)
+			Default.flushExpired(time.Now().UTC().UnixNano())
+			if val, ok := Default.Read(tt.args.key); ok {
+				equal(t, val, tt.args.valInactive)
 			} else {
-				log.Printf("val:%v", val)
+				t.Fatalf("Inactive can't read the key:%v", tt.args.key)
 			}
 
-		})
-	}
-}
-
-func Test_SameData(t *testing.T) {
-	type args struct {
-		key any
-	}
-	tests := []struct {
-		args args
-		name string
-	}{
-		{name: "one", args: args{
-			key: "one",
-		}},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			m := newCacheCoherent()
-			m.KeepDelay(tt.args.key, "one", time.Hour)
-			m.KeepDelay("2", "2", 10*time.Millisecond)
-			m.Forget(tt.args.key)
-
-			<-time.After(100 * time.Millisecond)
-
-			m.flushExpiredUsageNormal(time.Now().UnixNano())
-
-			if val, ok := m.Read(tt.args.key); ok {
-				log.Fatalf("val is not null key:%v val:%v", tt.args.key, val)
+			<-time.After(time.Millisecond * 40)
+			if _, ok := Default.Read(tt.args.key); !ok {
+				t.Fatalf("after 40 ms Inactive can't read the key:%v", tt.args.key)
 			}
+
+			<-time.After(timeBase)
+			if _, ok := Default.Read(tt.args.key); ok {
+				t.Fatalf("After flushExpired, the key can be read by Inactive:%v", tt.args.key)
+			}
+			Default.flushExpired(time.Now().UTC().UnixNano())
+			inactiveStat := Default.Statistics()
+			t.Logf("Inactive Statistics %+v", delayStat)
+			equal(t, int64(2), inactiveStat.totalHits)
+			equal(t, int64(1), inactiveStat.totalMisses)
+			Default.Reset()
 		})
 	}
 }

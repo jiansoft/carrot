@@ -1,6 +1,7 @@
 package carrot
 
 import (
+	"fmt"
 	"sync"
 
 	"github.com/jiansoft/robin"
@@ -25,7 +26,7 @@ func New() *CacheCoherent {
 	return newCacheCoherent()
 }
 
-func erase(targets ...*sync.Map) {
+func eraseMap(targets ...*sync.Map) {
 	for _, target := range targets {
 		target.Range(func(k, v any) bool {
 			target.Delete(k)
@@ -52,4 +53,13 @@ func countMap(targets ...*parallelCount) {
 		}, target, &wg)
 	}
 	wg.Wait()
+}
+
+func printMap(targets ...*sync.Map) {
+	for _, target := range targets {
+		target.Range(func(k, v any) bool {
+			fmt.Printf("key:%s %+v\n", k, v)
+			return true
+		})
+	}
 }
