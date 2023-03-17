@@ -48,7 +48,7 @@ func main() {
 	log.Printf("carrot.Default.Have(%s) = %v", key1, carrot.Default.Have(key1))
 
 	robin.Every(9).Seconds().Do(func() {
-		//memory.Forever(time.Now().Format("05"), val, carrot.CacheEntryOptions{TimeToLive: time.Second})
+		//memory.Forever(time.Now().Format("05"), val, carrot.entryOptions{TimeToLive: time.Second})
 		ttlKey := "ttl" + time.Now().Format("05")
 		memory.Delay(ttlKey, val, 10*time.Second)
 		inactiveKey := "inactive" + time.Now().Format("05")

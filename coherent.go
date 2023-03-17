@@ -55,7 +55,7 @@ func (cc *CacheCoherent) SetScanFrequency(frequency time.Duration) bool {
 
 // Forever never expiration
 func (cc *CacheCoherent) Forever(key, val any) {
-	cc.keep(key, val, CacheEntryOptions{TimeToLive: -time.Duration(1)})
+	cc.keep(key, val, entryOptions{TimeToLive: -time.Duration(1)})
 }
 
 // Until expires at a certain time. e.g. 2023-01-01 12:31:59.999
@@ -75,7 +75,7 @@ func (cc *CacheCoherent) Delay(key, val any, ttl time.Duration) {
 		return
 	}
 
-	cc.keep(key, val, CacheEntryOptions{TimeToLive: ttl})
+	cc.keep(key, val, entryOptions{TimeToLive: ttl})
 }
 
 // Inactive expires after it is inactive for more than a period of time
@@ -84,11 +84,11 @@ func (cc *CacheCoherent) Inactive(key, val any, inactive time.Duration) {
 		return
 	}
 
-	cc.keep(key, val, CacheEntryOptions{SlidingExpiration: inactive})
+	cc.keep(key, val, entryOptions{SlidingExpiration: inactive})
 }
 
 // Forever inserts an item into the memory
-func (cc *CacheCoherent) keep(key any, val any, option CacheEntryOptions) {
+func (cc *CacheCoherent) keep(key any, val any, option entryOptions) {
 	var (
 		nowUtc    = time.Now().UTC().UnixNano()
 		ttl       = option.TimeToLive.Nanoseconds()

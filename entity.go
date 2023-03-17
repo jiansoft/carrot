@@ -54,7 +54,7 @@ type (
 		isExpired bool
 	}
 
-	CacheEntryOptions struct {
+	entryOptions struct {
 		Size int64
 		// This is the time to live, e.g. 5 minutes from now. A negative value means forever.
 		// TimeToLive and SlidingExpiration can only choose one to set  if both are set, SlidingExpiration will take precedence.

@@ -30,7 +30,7 @@ import (
 func main() {
     
     //Keep an item in memory 
-    carrot.Default.KeepDelay("qq", "Qoo", time.Second)
+    carrot.Default.Delay("qq", "Qoo", time.Second)
     //Read returns the value if the key exists in the cache and it's not expired.
     val, ok := carrot.Default.Read("qq")
     //Have eturns true if the memory has the item and it's not expired.

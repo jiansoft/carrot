@@ -2,8 +2,11 @@ package carrot
 
 import (
 	"fmt"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/jiansoft/robin"
 )
 
 func Test_CacheCoherent(t *testing.T) {
@@ -59,7 +62,7 @@ func Test_CacheCoherent(t *testing.T) {
 	}
 }
 
-/*func Test_DataRace(t *testing.T) {
+func Test_DataRace(t *testing.T) {
 	tests := []struct {
 		memoryCache *CacheCoherent
 		name        string
@@ -73,71 +76,68 @@ func Test_CacheCoherent(t *testing.T) {
 			wg := sync.WaitGroup{}
 			wg.Add(1)
 			robin.RightNow().Do(func(loop int, m *CacheCoherent, swg *sync.WaitGroup) {
+				defer swg.Done()
 				for i := 0; i < loop; i++ {
 					key := fmt.Sprintf("RightNow-1-%v", i)
-					m.Delay(key, key, time.Hour)
+					if i%2 == 0 {
+						m.Inactive(key, struct{}{}, time.Second)
+					} else {
+						m.Delay(key, struct{}{}, time.Second)
+					}
 				}
-				swg.Done()
-			}, tt.loop, tt.memoryCache, &wg)
-			wg.Add(1)
-			robin.RightNow().Do(func(loop int, m *CacheCoherent, swg *sync.WaitGroup) {
-				for i := 0; i < loop; i++ {
-					key := fmt.Sprintf("RightNow-1-%v", i)
-					m.KeepDelayOrInactive(key, key, time.Hour, time.Second)
-				}
-				swg.Done()
-			}, tt.loop, tt.memoryCache, &wg)
-			wg.Add(1)
-			robin.RightNow().Do(func(loop int, m *CacheCoherent, swg *sync.WaitGroup) {
-				for i := 0; i < loop; i++ {
-					key := fmt.Sprintf("RightNow-1-%v", i)
-					m.Forget(key)
-				}
-				swg.Done()
-			}, tt.loop, tt.memoryCache, &wg)
-			wg.Add(1)
-			robin.RightNow().Do(func(loop int, m *CacheCoherent, swg *sync.WaitGroup) {
-				for i := 0; i < loop; i++ {
-					key := fmt.Sprintf("RightNow-1-%v", i)
-					_, _ = m.Read(key)
-				}
-				swg.Done()
-			}, tt.loop, Default, &wg)
-			wg.Add(1)
-			robin.RightNow().Do(func(loop int, m *CacheCoherent, swg *sync.WaitGroup) {
-				for i := 0; i < loop; i++ {
-					key := fmt.Sprintf("RightNow-1-%v", i)
-					m.Delay(key, key, 1*time.Hour)
-					_, _ = m.Read(key)
-					m.Forget(key)
-					_ = m.Have(key)
-					_, _ = m.Read(key)
-				}
-				swg.Done()
-			}, tt.loop, tt.memoryCache, &wg)
-			wg.Add(1)
-			robin.RightNow().Do(func(loop int, m *CacheCoherent, swg *sync.WaitGroup) {
-				for i := 0; i < loop; i++ {
-					tt.memoryCache.Reset()
-				}
-				swg.Done()
+
 			}, tt.loop, tt.memoryCache, &wg)
 
+			wg.Add(1)
+			robin.RightNow().Do(func(loop int, m *CacheCoherent, swg *sync.WaitGroup) {
+				defer swg.Done()
+				<-time.After(time.Millisecond * 100)
+				for i := 0; i < loop; i++ {
+					key := fmt.Sprintf("RightNow-1-%v", i)
+					_, _ = m.Read(key)
+					m.Forget(key)
+					_, _ = m.Read(key)
+				}
+			}, tt.loop, tt.memoryCache, &wg)
+
+			wg.Add(1)
+			robin.RightNow().Do(func(loop int, m *CacheCoherent, swg *sync.WaitGroup) {
+				defer swg.Done()
+				<-time.After(time.Millisecond * 500)
+				for i := 0; i < loop; i++ {
+					key := fmt.Sprintf("RightNow-1-%v", i)
+					m.Forget(key)
+				}
+			}, tt.loop, tt.memoryCache, &wg)
+
+			wg.Add(1)
+			robin.RightNow().Do(func(loop int, swg *sync.WaitGroup) {
+				defer swg.Done()
+				for i := 0; i < loop; i++ {
+					key := fmt.Sprintf("RightNow-1-%v", i)
+					// use Default
+					_, _ = Default.Read(key)
+				}
+			}, tt.loop, &wg)
+
 			wg.Wait()
-			t.Logf("Statistics %+v", tt.memoryCache.Statistics())
+			state := tt.memoryCache.Statistics()
+			t.Logf("Statistics %+v", state)
+			equal(t, tt.loop*2, int(state.totalMisses+state.totalHits))
 			tt.memoryCache.Reset()
+
 			wg.Add(1)
 			robin.RightNow().Do(keep, tt.loop, tt.memoryCache, &wg, 1)
-			<-time.After(time.Millisecond *100)
+			<-time.After(time.Millisecond * 10)
 			wg.Add(1)
 			robin.RightNow().Do(read, t, tt.loop, tt.memoryCache, &wg, 1)
-			<-time.After(time.Millisecond *100)
+
 			wg.Add(1)
 			robin.RightNow().Do(keep, tt.loop, tt.memoryCache, &wg, 2)
-			<-time.After(time.Millisecond *100)
+			<-time.After(time.Millisecond * 10)
 			wg.Add(1)
 			robin.RightNow().Do(read, t, tt.loop, tt.memoryCache, &wg, 2)
-			<-time.After(time.Millisecond *100)
+
 			wg.Add(1)
 			robin.RightNow().Do(keep, tt.loop, tt.memoryCache, &wg, 3)
 			wg.Wait()
@@ -147,21 +147,23 @@ func Test_CacheCoherent(t *testing.T) {
 			t.Logf("Reset Statistics %+v", tt.memoryCache.Statistics())
 		})
 	}
-}*/
+}
 
-/*func keep(loop int, m *CacheCoherent, swg *sync.WaitGroup, index int) {
+func keep(loop int, m *CacheCoherent, swg *sync.WaitGroup, index int) {
+	defer swg.Done()
 	for i := 0; i < loop; i++ {
 		key := fmt.Sprintf("QQ-%v-%v", i, index)
+		ttl := time.Duration(int64(100+i) * int64(time.Millisecond))
 		if i%2 == 0 {
-			m.KeepDelayOrInactive(key, key, time.Duration(int64(10+i)*int64(time.Millisecond)), time.Second)
+			m.Inactive(key, struct{}{}, ttl)
 		} else {
-			m.Delay(key, key, time.Duration(int64(10+i)*int64(time.Second)))
+			m.Delay(key, struct{}{}, ttl)
 		}
 	}
-	swg.Done()
 }
 
 func read(t *testing.T, loop int, m *CacheCoherent, swg *sync.WaitGroup, index int) {
+	defer swg.Done()
 	for i := 0; i < loop; i++ {
 		key := fmt.Sprintf("QQ-%v-%v", i, index)
 		if _, ok := m.Read(key); ok {
@@ -169,8 +171,7 @@ func read(t *testing.T, loop int, m *CacheCoherent, swg *sync.WaitGroup, index i
 		}
 		m.Forget(key)
 	}
-	swg.Done()
-}*/
+}
 
 func Test_Default(t *testing.T) {
 	type args struct {
