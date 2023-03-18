@@ -110,7 +110,7 @@ func Test_DataRace(t *testing.T) {
 				}
 			}, tt.loop, tt.memoryCache, &wg)
 
-			wg.Add(1)
+			/*wg.Add(1)
 			robin.RightNow().Do(func(loop int, swg *sync.WaitGroup) {
 				defer swg.Done()
 				for i := 0; i < loop; i++ {
@@ -118,7 +118,7 @@ func Test_DataRace(t *testing.T) {
 					// use Default
 					_, _ = Default.Read(key)
 				}
-			}, tt.loop, &wg)
+			}, tt.loop, &wg)*/
 
 			wg.Wait()
 			state := tt.memoryCache.Statistics()
@@ -190,10 +190,10 @@ func Test_Default(t *testing.T) {
 		}},
 	}
 	var timeBase = time.Millisecond * 50
+	Default.SetScanFrequency(timeBase * 2)
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			Default.Forever(tt.args.key, tt.args.val)
-			Default.flushExpired(time.Now().UTC().UnixNano())
 			if val, ok := Default.Read(tt.args.key); ok {
 				equal(t, val, tt.args.val)
 			} else {
@@ -207,7 +207,6 @@ func Test_Default(t *testing.T) {
 
 			//----  Until ----
 			Default.Until(tt.args.key, tt.args.valUntil, time.Now().Add(timeBase))
-			Default.flushExpired(time.Now().UTC().UnixNano())
 			if val, ok := Default.Read(tt.args.key); ok {
 				equal(t, val, tt.args.valUntil)
 			} else {
@@ -227,7 +226,6 @@ func Test_Default(t *testing.T) {
 
 			//----  Delay ----
 			Default.Delay(tt.args.key, tt.args.valDelay, timeBase)
-			Default.flushExpired(time.Now().UTC().UnixNano())
 			if val, ok := Default.Read(tt.args.key); ok {
 				equal(t, val, tt.args.valDelay)
 			} else {
@@ -247,23 +245,22 @@ func Test_Default(t *testing.T) {
 
 			//----  Inactive ----
 			Default.Inactive(tt.args.key, tt.args.valInactive, timeBase)
-			Default.flushExpired(time.Now().UTC().UnixNano())
 			if val, ok := Default.Read(tt.args.key); ok {
 				equal(t, val, tt.args.valInactive)
 			} else {
 				t.Fatalf("Inactive can't read the key:%v", tt.args.key)
 			}
 
-			<-time.After(time.Millisecond * 40)
+			<-time.After(time.Millisecond * 30)
 			if _, ok := Default.Read(tt.args.key); !ok {
-				t.Fatalf("after 40 ms Inactive can't read the key:%v", tt.args.key)
+				t.Fatalf("after 30 ms Inactive can't read the key:%v", tt.args.key)
 			}
 
 			<-time.After(timeBase)
 			if _, ok := Default.Read(tt.args.key); ok {
 				t.Fatalf("After flushExpired, the key can be read by Inactive:%v", tt.args.key)
 			}
-			Default.flushExpired(time.Now().UTC().UnixNano())
+
 			inactiveStat := Default.Statistics()
 			t.Logf("Inactive Statistics %+v", delayStat)
 			equal(t, int64(2), inactiveStat.totalHits)

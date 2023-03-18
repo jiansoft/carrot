@@ -236,10 +236,7 @@ func (cc *CacheCoherent) flushExpired(nowUtc int64) {
 			break
 		}
 
-		//if ce.evictionReason != removed {
-		//fmt.Printf("Delete(%s) %+v\n",ce.key,ce)
 		cc.usage.Delete(ce.key)
-		//}
 	}
 }
 
