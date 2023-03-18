@@ -81,8 +81,10 @@ func Test_DataRace(t *testing.T) {
 					key := fmt.Sprintf("RightNow-1-%v", i)
 					if i%2 == 0 {
 						m.Inactive(key, struct{}{}, time.Second)
+						Default.Inactive(key, struct{}{}, time.Second)
 					} else {
 						m.Delay(key, struct{}{}, time.Second)
+						Default.Delay(key, struct{}{}, time.Second)
 					}
 				}
 
@@ -95,8 +97,11 @@ func Test_DataRace(t *testing.T) {
 				for i := 0; i < loop; i++ {
 					key := fmt.Sprintf("RightNow-1-%v", i)
 					_, _ = m.Read(key)
+					_, _ = Default.Read(key)
 					m.Forget(key)
+					Default.Forget(key)
 					_, _ = m.Read(key)
+					_, _ = Default.Read(key)
 				}
 			}, tt.loop, tt.memoryCache, &wg)
 
@@ -107,24 +112,16 @@ func Test_DataRace(t *testing.T) {
 				for i := 0; i < loop; i++ {
 					key := fmt.Sprintf("RightNow-1-%v", i)
 					m.Forget(key)
+					Default.Forget(key)
 				}
 			}, tt.loop, tt.memoryCache, &wg)
-
-			/*wg.Add(1)
-			robin.RightNow().Do(func(loop int, swg *sync.WaitGroup) {
-				defer swg.Done()
-				for i := 0; i < loop; i++ {
-					key := fmt.Sprintf("RightNow-1-%v", i)
-					// use Default
-					_, _ = Default.Read(key)
-				}
-			}, tt.loop, &wg)*/
 
 			wg.Wait()
 			state := tt.memoryCache.Statistics()
 			t.Logf("Statistics %+v", state)
 			equal(t, tt.loop*2, int(state.totalMisses+state.totalHits))
 			tt.memoryCache.Reset()
+			Default.Reset()
 
 			wg.Add(1)
 			robin.RightNow().Do(keep, tt.loop, tt.memoryCache, &wg, 1)
@@ -191,6 +188,7 @@ func Test_Default(t *testing.T) {
 	}
 	var timeBase = time.Millisecond * 50
 	Default.SetScanFrequency(timeBase * 2)
+	Default.Reset()
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			Default.Forever(tt.args.key, tt.args.val)
