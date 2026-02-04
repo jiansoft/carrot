@@ -10,11 +10,11 @@ import (
 
 const defaultQueueCapacity = 512
 
-// priorityQueue is a priority queue implemented as a min heap.
+// A priorityQueue is a priority queue implemented as a min heap.
 // The 0th element is the lowest value (earliest expiration).
 type priorityQueue []*cacheEntry
 
-// newPriorityQueue creates a new priority queue with the specified capacity.
+// NewPriorityQueue creates a new priority queue with the specified capacity.
 func newPriorityQueue(capacity int) *priorityQueue {
 	pq := make(priorityQueue, 0, capacity)
 	heap.Init(&pq)
@@ -81,12 +81,12 @@ func (pq *priorityQueue) Pop() any {
 	return ce
 }
 
-// isEmpty returns true if the element amount is zero.
+// IsEmpty returns true if the element amount is zero.
 func (pq *priorityQueue) isEmpty() bool {
 	return pq.Len() == 0
 }
 
-// clear removes all elements and releases references to avoid memory leak.
+// Clear removes all elements and releases references to avoid memory leak.
 func (pq *priorityQueue) clear() {
 	for i := range *pq {
 		(*pq)[i] = nil

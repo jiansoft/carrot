@@ -1,6 +1,7 @@
 package carrot
 
 import (
+	"context"
 	"testing"
 	"time"
 )
@@ -27,7 +28,7 @@ func TestCacheEntryIsExpired(t *testing.T) {
 		t.Error("New entry should not be expired")
 	}
 
-	entry.setExpired(reasonExpired)
+	entry.setExpired(int32(EvictionReasonExpired))
 
 	if !entry.isExpired() {
 		t.Error("Entry should be expired after setExpired")
@@ -84,7 +85,7 @@ func TestCacheEntryAbsoluteExpiration(t *testing.T) {
 func TestCacheEntrySetExpired(t *testing.T) {
 	entry := &cacheEntry{priority: 100}
 
-	entry.setExpired(reasonRemoved)
+	entry.setExpired(int32(EvictionReasonRemoved))
 
 	if !entry.isExpired() {
 		t.Error("Entry should be expired after setExpired")
@@ -94,13 +95,13 @@ func TestCacheEntrySetExpired(t *testing.T) {
 		t.Errorf("Priority should be 0 after setExpired, got %d", entry.getPriority())
 	}
 
-	if entry.evictionReason != reasonRemoved {
-		t.Errorf("evictionReason should be reasonRemoved")
+	if entry.getEvictionReason() != EvictionReasonRemoved {
+		t.Errorf("evictionReason should be EvictionReasonRemoved")
 	}
 
 	// Second call should not change reason
-	entry.setExpired(reasonExpired)
-	if entry.evictionReason != reasonRemoved {
+	entry.setExpired(int32(EvictionReasonExpired))
+	if entry.getEvictionReason() != EvictionReasonRemoved {
 		t.Error("setExpired should not change reason if already set")
 	}
 }
@@ -189,4 +190,80 @@ func TestCacheEntryCheckForExpiredTime(t *testing.T) {
 	if absoluteNotExpiredEntry.checkForExpiredTime(now) {
 		t.Error("Entry with future absoluteExpiration should not be expired")
 	}
+}
+
+// TestCacheEntryTokenExpiration tests context-based token expiration.
+func TestCacheEntryTokenExpiration(t *testing.T) {
+	now := time.Now().UnixNano()
+	ctx, cancel := context.WithCancel(context.Background())
+
+	entry := &cacheEntry{
+		kind:               KindNormal,
+		absoluteExpiration: now + int64(time.Hour),
+		cancelCtx:          ctx,
+		cancelFunc:         cancel,
+	}
+
+	// Should not be expired initially
+	if entry.checkExpired(now) {
+		t.Error("Entry should not be expired before token cancellation")
+	}
+
+	// Cancel the token
+	cancel()
+
+	// Should be expired after token cancellation
+	if !entry.checkExpired(now) {
+		t.Error("Entry should be expired after token cancellation")
+	}
+
+	if entry.getEvictionReason() != EvictionReasonTokenExpired {
+		t.Errorf("Eviction reason should be EvictionReasonTokenExpired, got %v", entry.getEvictionReason())
+	}
+}
+
+// TestCacheEntryInvokeEvictionCallback tests the eviction callback invocation.
+func TestCacheEntryInvokeEvictionCallback(t *testing.T) {
+	called := false
+	var callbackKey, callbackValue any
+	var callbackReason EvictionReason
+
+	entry := &cacheEntry{
+		key:   "testKey",
+		value: "testValue",
+		evictionCallback: func(key, value any, reason EvictionReason) {
+			called = true
+			callbackKey = key
+			callbackValue = value
+			callbackReason = reason
+		},
+	}
+
+	entry.setExpired(int32(EvictionReasonExpired))
+	entry.invokeEvictionCallback()
+
+	if !called {
+		t.Error("Eviction callback should have been called")
+	}
+	if callbackKey != "testKey" {
+		t.Errorf("Callback key = %v, want 'testKey'", callbackKey)
+	}
+	if callbackValue != "testValue" {
+		t.Errorf("Callback value = %v, want 'testValue'", callbackValue)
+	}
+	if callbackReason != EvictionReasonExpired {
+		t.Errorf("Callback reason = %v, want EvictionReasonExpired", callbackReason)
+	}
+}
+
+// TestCacheEntryInvokeEvictionCallbackNil tests that nil callback doesn't panic.
+func TestCacheEntryInvokeEvictionCallbackNil(t *testing.T) {
+	entry := &cacheEntry{
+		key:              "testKey",
+		value:            "testValue",
+		evictionCallback: nil,
+	}
+
+	// Should not panic
+	entry.invokeEvictionCallback()
 }

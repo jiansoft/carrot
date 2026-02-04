@@ -8,27 +8,26 @@ import (
 // ConcurrentPriorityQueue is a thread-safe priority queue.
 type ConcurrentPriorityQueue struct {
 	pq *priorityQueue
-	mu *sync.Mutex
+	mu sync.RWMutex
 }
 
-// newConcurrentPriorityQueue creates a new ConcurrentPriorityQueue with the specified capacity.
+// NewConcurrentPriorityQueue creates a new ConcurrentPriorityQueue with the specified capacity.
 func newConcurrentPriorityQueue(capacity int) *ConcurrentPriorityQueue {
 	pq := newPriorityQueue(capacity)
 	cpq := ConcurrentPriorityQueue{
 		pq: pq,
-		mu: new(sync.Mutex),
 	}
 	return &cpq
 }
 
-// enqueue pushes the element x onto the heap.
+// Enqueue pushes the element x onto the heap.
 func (cpq *ConcurrentPriorityQueue) enqueue(ce *cacheEntry) {
 	cpq.mu.Lock()
 	heap.Push(cpq.pq, ce)
 	cpq.mu.Unlock()
 }
 
-// dequeue removes and returns the first element if its priority <= limit.
+// Dequeue removes and returns the first element if its priority <= limit.
 func (cpq *ConcurrentPriorityQueue) dequeue(limit int64) (*cacheEntry, bool) {
 	cpq.mu.Lock()
 	defer cpq.mu.Unlock()
@@ -47,33 +46,27 @@ func (cpq *ConcurrentPriorityQueue) dequeue(limit int64) (*cacheEntry, bool) {
 	return ce, true
 }
 
-// update modifies the element's position in the queue based on its new priority.
+// Update modifies the element's position in the queue based on its new priority.
 func (cpq *ConcurrentPriorityQueue) update(ce *cacheEntry) {
 	cpq.mu.Lock()
-	defer cpq.mu.Unlock()
-
 	// boundary check to prevent panic
-	if ce.index < 0 || ce.index >= cpq.pq.Len() {
-		return
+	if ce.index >= 0 && ce.index < cpq.pq.Len() {
+		heap.Fix(cpq.pq, ce.index)
 	}
-
-	heap.Fix(cpq.pq, ce.index)
+	cpq.mu.Unlock()
 }
 
-// remove removes the element from the heap.
+// Remove removes the element from the heap.
 func (cpq *ConcurrentPriorityQueue) remove(ce *cacheEntry) {
 	cpq.mu.Lock()
-	defer cpq.mu.Unlock()
-
 	l := cpq.pq.Len()
-	if l == 0 || ce.index < 0 || ce.index >= l {
-		return
+	if l > 0 && ce.index >= 0 && ce.index < l {
+		heap.Remove(cpq.pq, ce.index)
 	}
-
-	heap.Remove(cpq.pq, ce.index)
+	cpq.mu.Unlock()
 }
 
-// erase removes all elements from the queue.
+// Erase removes all elements from the queue.
 func (cpq *ConcurrentPriorityQueue) erase() {
 	cpq.mu.Lock()
 	cpq.pq.clear()
@@ -82,7 +75,20 @@ func (cpq *ConcurrentPriorityQueue) erase() {
 
 // Count returns the number of elements in the queue.
 func (cpq *ConcurrentPriorityQueue) Count() int {
-	cpq.mu.Lock()
-	defer cpq.mu.Unlock()
-	return cpq.pq.Len()
+	cpq.mu.RLock()
+	n := cpq.pq.Len()
+	cpq.mu.RUnlock()
+	return n
+}
+
+// Peek returns the minimum priority without removing it.
+func (cpq *ConcurrentPriorityQueue) peek() (int64, bool) {
+	cpq.mu.RLock()
+	defer cpq.mu.RUnlock()
+
+	if cpq.pq.isEmpty() {
+		return 0, false
+	}
+
+	return (*cpq.pq)[0].getPriority(), true
 }

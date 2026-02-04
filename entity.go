@@ -1,20 +1,27 @@
 package carrot
 
 import (
+	"context"
 	"sync/atomic"
 	"time"
 )
 
+// EvictionReason represents why a cache entry was evicted.
+type EvictionReason int32
+
 const (
-	reasonNone int32 = iota
-	// reasonRemoved Manually removed
-	reasonRemoved
-	// reasonReplaced Overwritten
-	reasonReplaced
-	// reasonExpired Timed out
-	reasonExpired
-	// reasonCapacity Overflow
-	reasonCapacity
+	// EvictionReasonNone indicates the entry has not been evicted.
+	EvictionReasonNone EvictionReason = iota
+	// EvictionReasonRemoved indicates the entry was manually removed.
+	EvictionReasonRemoved
+	// EvictionReasonReplaced indicates the entry was overwritten.
+	EvictionReasonReplaced
+	// EvictionReasonExpired indicates the entry timed out.
+	EvictionReasonExpired
+	// EvictionReasonCapacity indicates the entry was removed due to capacity overflow.
+	EvictionReasonCapacity
+	// EvictionReasonTokenExpired indicates the entry was removed due to token expiration.
+	EvictionReasonTokenExpired
 )
 
 // Cache priority levels for cache eviction policies.
@@ -41,6 +48,12 @@ type (
 	CachePriority int
 	cacheKind     int
 
+	// PostEvictionCallback is called after a cache entry is evicted.
+	// key: the cache key
+	// value: the cached value
+	// reason: why the entry was evicted
+	PostEvictionCallback func(key any, value any, reason EvictionReason)
+
 	cacheEntry struct {
 		key   any
 		value any
@@ -48,6 +61,10 @@ type (
 		evictionReason int32
 		// cache kind (sliding or normal)
 		kind cacheKind
+		// cache priority for eviction
+		cachePriority CachePriority
+		// size of the cache entry (for size limit calculation)
+		size int64
 		// created time (unix nanoseconds)
 		created int64
 		// lives at this point in time. (unix nanoseconds, use atomic operations)
@@ -62,75 +79,110 @@ type (
 		index int
 		// is it expired (use atomic operations: 0 = false, 1 = true)
 		expired int32
+		// for lazy deletion in priority queue (use atomic operations: 0 = active, 1 = deleted)
+		deleted int32
+		// post eviction callback
+		evictionCallback PostEvictionCallback
+		// cancellation context for token-based expiration
+		cancelCtx context.Context
+		// cancel function for the context
+		cancelFunc context.CancelFunc
 	}
 
-	entryOptions struct {
-		// This is the time to live, e.g. 5 minutes from now. A negative value means forever.
+	// EntryOptions represents options for creating a cache entry.
+	EntryOptions struct {
+		// TimeToLive is the time to live, e.g. 5 minutes from now. A negative value means forever.
 		// TimeToLive and SlidingExpiration can only choose one to set. If both are set, SlidingExpiration will take precedence.
 		TimeToLive time.Duration
-		// how long a cache entry can be inactive (e.g. not accessed). **only positive**
+		// SlidingExpiration is how long a cache entry can be inactive (e.g. not accessed). **only positive**
 		SlidingExpiration time.Duration
+		// Priority is the cache priority for eviction. Default is PriorityNormal.
+		Priority CachePriority
+		// Size is the size of the cache entry. Used for size limit calculation.
+		Size int64
+		// PostEvictionCallback is called after the entry is evicted.
+		PostEvictionCallback PostEvictionCallback
+		// ExpirationToken is a context that can trigger expiration when cancelled.
+		ExpirationToken context.Context
 	}
+
+	// internal use
+	entryOptions = EntryOptions
 )
 
-// isSliding returns true if the cache is sliding kind.
+// IsSliding returns true if the cache is sliding kind.
 func (ce *cacheEntry) isSliding() bool {
 	return ce.kind == KindSliding
 }
 
-// isExpired returns true if the cache entry is expired.
+// IsExpired returns true if the cache entry is expired.
 func (ce *cacheEntry) isExpired() bool {
 	return atomic.LoadInt32(&ce.expired) == 1
 }
 
-// getPriority returns the priority value atomically.
+// GetPriority returns the priority value atomically.
 func (ce *cacheEntry) getPriority() int64 {
 	return atomic.LoadInt64(&ce.priority)
 }
 
-// setPriority sets the priority value atomically.
+// SetPriority sets the priority value atomically.
 func (ce *cacheEntry) setPriority(p int64) {
 	atomic.StoreInt64(&ce.priority, p)
 }
 
-// getLastAccessed returns the lastAccessed value atomically.
+// GetLastAccessed returns the lastAccessed value atomically.
 func (ce *cacheEntry) getLastAccessed() int64 {
 	return atomic.LoadInt64(&ce.lastAccessed)
 }
 
-// setLastAccessed sets the lastAccessed value atomically.
+// SetLastAccessed sets the lastAccessed value atomically.
 func (ce *cacheEntry) setLastAccessed(t int64) {
 	atomic.StoreInt64(&ce.lastAccessed, t)
 }
 
-// getAbsoluteExpiration returns the absoluteExpiration value atomically.
+// GetAbsoluteExpiration returns the absoluteExpiration value atomically.
 func (ce *cacheEntry) getAbsoluteExpiration() int64 {
 	return atomic.LoadInt64(&ce.absoluteExpiration)
 }
 
-// setAbsoluteExpiration sets the absoluteExpiration value atomically.
+// SetAbsoluteExpiration sets the absoluteExpiration value atomically.
 func (ce *cacheEntry) setAbsoluteExpiration(t int64) {
 	atomic.StoreInt64(&ce.absoluteExpiration, t)
 }
 
-// setExpired sets the entity expired with the given reason.
+// SetExpired sets the entity expired with the given reason.
 // Uses atomic compare-and-swap to ensure thread safety.
 func (ce *cacheEntry) setExpired(reason int32) {
-	atomic.CompareAndSwapInt32(&ce.evictionReason, reasonNone, reason)
+	atomic.CompareAndSwapInt32(&ce.evictionReason, int32(EvictionReasonNone), reason)
 	ce.setPriority(0)
 	atomic.StoreInt32(&ce.expired, 1)
 }
 
-// checkExpired returns true if the item has expired (and set it to expire).
+// GetEvictionReason returns the eviction reason.
+func (ce *cacheEntry) getEvictionReason() EvictionReason {
+	return EvictionReason(atomic.LoadInt32(&ce.evictionReason))
+}
+
+// CheckExpired returns true if the item has expired (and set it to expire).
 func (ce *cacheEntry) checkExpired(utcNow int64) bool {
 	if ce.isExpired() {
 		return true
 	}
 
+	// Check token expiration
+	if ce.cancelCtx != nil {
+		select {
+		case <-ce.cancelCtx.Done():
+			ce.setExpired(int32(EvictionReasonTokenExpired))
+			return true
+		default:
+		}
+	}
+
 	return ce.checkForExpiredTime(utcNow)
 }
 
-// checkForExpiredTime returns true if the item has expired (and set it to expire).
+// CheckForExpiredTime returns true if the item has expired (and set it to expire).
 func (ce *cacheEntry) checkForExpiredTime(utcNow int64) bool {
 	absExp := ce.getAbsoluteExpiration()
 	if absExp < 0 && ce.slidingExpiration == 0 {
@@ -139,14 +191,25 @@ func (ce *cacheEntry) checkForExpiredTime(utcNow int64) bool {
 	}
 
 	if ce.isSliding() && ce.slidingExpiration < time.Duration(utcNow-ce.getLastAccessed()) {
-		ce.setExpired(reasonExpired)
+		ce.setExpired(int32(EvictionReasonExpired))
 		return true
 	}
 
 	if absExp <= utcNow {
-		ce.setExpired(reasonExpired)
+		ce.setExpired(int32(EvictionReasonExpired))
 		return true
 	}
 
 	return false
+}
+
+// InvokeEvictionCallback calls the eviction callback if set.
+func (ce *cacheEntry) invokeEvictionCallback() {
+	if ce.evictionCallback != nil {
+		ce.evictionCallback(ce.key, ce.value, ce.getEvictionReason())
+	}
+	// Cancel the context if it was created
+	if ce.cancelFunc != nil {
+		ce.cancelFunc()
+	}
 }
