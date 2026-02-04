@@ -9,56 +9,55 @@ import (
 	"github.com/jiansoft/robin"
 )
 
-var queueCapacity = 512
-
 type (
-	// CacheCoherent Wrapper for the memory cache entries collection.
+	// CacheCoherent is a thread-safe in-memory cache that supports multiple expiration policies.
 	CacheCoherent struct {
 		cpq *ConcurrentPriorityQueue
 		// save cache entry.
 		usage sync.Map
-		stats CacheStatistics
+		// number of items in the usage map.
+		usageCount int64
+		stats      CacheStatistics
 		// currently in the state of scanning for expired.
 		onScanForExpired atomic.Bool
 		// the minimum length of time between successive scans for expired items.
-		expirationScanFrequency time.Duration
+		expirationScanFrequency int64
 		// last expired scanning time(UnixNano)
 		lastExpirationScan int64
 	}
 )
 
-func newCacheCoherent(capacity ...int) *CacheCoherent {
-	if len(capacity) > 0 {
-		queueCapacity = capacity[0]
-	}
-
+// newCacheCoherent creates a new CacheCoherent instance.
+func newCacheCoherent() *CacheCoherent {
 	coherent := &CacheCoherent{
-		cpq:                     newConcurrentPriorityQueue(queueCapacity),
+		cpq:                     newConcurrentPriorityQueue(defaultQueueCapacity),
 		stats:                   CacheStatistics{},
 		lastExpirationScan:      time.Now().UTC().UnixNano(),
-		expirationScanFrequency: time.Minute,
+		expirationScanFrequency: int64(time.Minute),
 	}
 
 	return coherent
 }
 
-// SetScanFrequency sets a new frequency value
+// SetScanFrequency sets a new frequency value for scanning expired items.
+// Returns false if the frequency is not positive.
 func (cc *CacheCoherent) SetScanFrequency(frequency time.Duration) bool {
 	if frequency <= 0 {
 		return false
 	}
 
-	cc.expirationScanFrequency = frequency
+	atomic.StoreInt64(&cc.expirationScanFrequency, int64(frequency))
 
 	return true
 }
 
-// Forever never expiration
+// Forever stores an item that never expires.
 func (cc *CacheCoherent) Forever(key, val any) {
-	cc.keep(key, val, entryOptions{TimeToLive: -time.Duration(1)})
+	cc.keep(key, val, entryOptions{TimeToLive: -1})
 }
 
-// Until expires at a certain time. e.g. 2023-01-01 12:31:59.999
+// Until stores an item that expires at a certain time. e.g. 2023-01-01 12:31:59.999
+// If the specified time has already passed, the existing item with the same key will be removed.
 func (cc *CacheCoherent) Until(key, val any, until time.Time) {
 	var (
 		untilUtc = until.UTC()
@@ -66,19 +65,22 @@ func (cc *CacheCoherent) Until(key, val any, until time.Time) {
 		ttl      = untilUtc.Sub(nowUtc)
 	)
 
-	cc.Delay(key, val, ttl)
-}
-
-// Delay expires after a period of time. e.g. time.Hour, it will expire after one hour from now
-func (cc *CacheCoherent) Delay(key, val any, ttl time.Duration) {
 	if ttl <= 0 {
+		cc.Forget(key)
 		return
 	}
 
 	cc.keep(key, val, entryOptions{TimeToLive: ttl})
 }
 
-// Inactive expires after it is inactive for more than a period of time
+// Delay stores an item that expires after a period of time. e.g. time.Hour will expire after one hour from now.
+// Use a negative or zero duration to store an item that never expires.
+func (cc *CacheCoherent) Delay(key, val any, ttl time.Duration) {
+	cc.keep(key, val, entryOptions{TimeToLive: ttl})
+}
+
+// Inactive stores an item that expires after it is inactive for more than a period of time.
+// Each read will reset the expiration timer. Does nothing if inactive is not positive.
 func (cc *CacheCoherent) Inactive(key, val any, inactive time.Duration) {
 	if inactive <= 0 {
 		return
@@ -87,7 +89,7 @@ func (cc *CacheCoherent) Inactive(key, val any, inactive time.Duration) {
 	cc.keep(key, val, entryOptions{SlidingExpiration: inactive})
 }
 
-// Forever inserts an item into the memory
+// keep inserts an item into the memory cache.
 func (cc *CacheCoherent) keep(key any, val any, option entryOptions) {
 	var (
 		nowUtc    = time.Now().UTC().UnixNano()
@@ -98,17 +100,17 @@ func (cc *CacheCoherent) keep(key any, val any, option entryOptions) {
 	)
 
 	if option.SlidingExpiration > 0 {
-		//滑動首次的到期時間為 now + SlidingExpiration
+		// sliding: initial expiration = now + SlidingExpiration
 		utcAbsExp = nowUtc + option.SlidingExpiration.Nanoseconds()
 		priority = utcAbsExp
 		kind = KindSliding
 	} else {
-		//永不過期 ttl 為 -1
+		// ttl <= 0 means never expire
 		if ttl > 0 {
 			utcAbsExp = nowUtc + ttl
 			priority = utcAbsExp
 		} else {
-			// 永不到期
+			// never expire
 			utcAbsExp = -1
 			priority = int64(math.MaxInt64)
 		}
@@ -128,45 +130,51 @@ func (cc *CacheCoherent) keep(key any, val any, option entryOptions) {
 
 	priorEntry, priorExist := cc.loadCacheEntryFromUsage(key)
 	if priorExist {
-		priorEntry.setExpired(replaced)
+		// remove from queue first to avoid race condition
 		cc.cpq.remove(priorEntry)
+		priorEntry.setExpired(reasonReplaced)
 	}
 
 	if newEntry.checkExpired(nowUtc) {
 		// already expired
 		if priorExist {
 			cc.usage.Delete(key)
+			atomic.AddInt64(&cc.usageCount, -1)
 		}
 	} else {
 		// Try to add or update the new entry.
 		cc.usage.Store(key, newEntry)
 		cc.cpq.enqueue(newEntry)
+		if !priorExist {
+			atomic.AddInt64(&cc.usageCount, 1)
+		}
 	}
 
 	cc.scanForExpiredItemsIfNeeded(nowUtc)
 }
 
-// Read returns the value if the key exists in the cache
+// Read returns the value if the key exists in the cache and it's not expired.
+// For sliding expiration items, each read resets the expiration timer.
 func (cc *CacheCoherent) Read(key any) (any, bool) {
 	nowUtc := time.Now().UTC().UnixNano()
-	if ce, exist := cc.loadCacheEntryFromUsage(key); exist {
-		if !ce.checkExpired(nowUtc) {
-			atomic.AddInt64(&cc.stats.totalHits, 1)
-			ce.lastAccessed = nowUtc
+	ce, exist := cc.loadCacheEntryFromUsage(key)
 
-			if ce.isSliding() {
-				ce.absoluteExpiration = nowUtc + ce.slidingExpiration.Nanoseconds()
-				ce.priority = ce.absoluteExpiration
-				cc.cpq.update(ce)
-			}
+	if exist && !ce.checkExpired(nowUtc) {
+		atomic.AddInt64(&cc.stats.totalHits, 1)
+		ce.setLastAccessed(nowUtc)
 
-			cc.scanForExpiredItemsIfNeeded(nowUtc)
-			return ce.value, true
+		if ce.isSliding() {
+			newExp := nowUtc + ce.slidingExpiration.Nanoseconds()
+			ce.setAbsoluteExpiration(newExp)
+			ce.setPriority(newExp)
+			cc.cpq.update(ce)
 		}
+
+		cc.scanForExpiredItemsIfNeeded(nowUtc)
+		return ce.value, true
 	}
 
 	atomic.AddInt64(&cc.stats.totalMisses, 1)
-
 	cc.scanForExpiredItemsIfNeeded(nowUtc)
 
 	return nil, false
@@ -178,30 +186,33 @@ func (cc *CacheCoherent) Have(key any) bool {
 	return exist
 }
 
-// Forget removes an item from the memory
+// Forget removes an item from the memory.
 func (cc *CacheCoherent) Forget(key any) {
 	cc.forget(key, time.Now().UTC().UnixNano())
 }
 
 func (cc *CacheCoherent) forget(key any, nowUtc int64) {
 	if ce, exist := cc.loadCacheEntryFromUsage(key); exist {
-		ce.setExpired(removed)
-		cc.usage.Delete(key)
+		// remove from queue first to avoid race condition
 		cc.cpq.remove(ce)
+		ce.setExpired(reasonRemoved)
+		cc.usage.Delete(key)
+		atomic.AddInt64(&cc.usageCount, -1)
 	}
 
 	cc.scanForExpiredItemsIfNeeded(nowUtc)
 }
 
-// Reset removes all items from the memory
+// Reset removes all items from the memory and resets statistics.
 func (cc *CacheCoherent) Reset() {
-	eraseMap(&cc.usage)
+	cc.usage = sync.Map{}
+	atomic.StoreInt64(&cc.usageCount, 0)
 	cc.cpq.erase()
 	atomic.StoreInt64(&cc.stats.totalHits, 0)
 	atomic.StoreInt64(&cc.stats.totalMisses, 0)
 }
 
-// loadCacheEntryFromUsage returns cacheEntry if it exists in the cache
+// loadCacheEntryFromUsage returns cacheEntry if it exists in the cache.
 func (cc *CacheCoherent) loadCacheEntryFromUsage(key any) (*cacheEntry, bool) {
 	if val, ok := cc.usage.Load(key); ok {
 		return val.(*cacheEntry), true
@@ -211,7 +222,7 @@ func (cc *CacheCoherent) loadCacheEntryFromUsage(key any) (*cacheEntry, bool) {
 }
 
 func (cc *CacheCoherent) scanForExpiredItemsIfNeeded(nowUtc int64) {
-	if cc.expirationScanFrequency > time.Duration(nowUtc-cc.lastExpirationScan) {
+	if atomic.LoadInt64(&cc.expirationScanFrequency) > nowUtc-atomic.LoadInt64(&cc.lastExpirationScan) {
 		return
 	}
 
@@ -222,14 +233,14 @@ func (cc *CacheCoherent) scanForExpiredItemsIfNeeded(nowUtc int64) {
 	robin.RightNow().Do(cc.flushExpired, nowUtc)
 }
 
-// flushExpired remove has expired item from the memory
+// flushExpired removes expired items from the memory.
 func (cc *CacheCoherent) flushExpired(nowUtc int64) {
 	defer func() {
-		cc.lastExpirationScan = nowUtc
+		atomic.StoreInt64(&cc.lastExpirationScan, nowUtc)
 		cc.onScanForExpired.Store(false)
 	}()
 
-	loop := cc.cpq.pq.Len()
+	loop := cc.cpq.Count()
 	for i := 0; i < loop; i++ {
 		ce, yes := cc.cpq.dequeue(nowUtc)
 		if !yes {
@@ -237,17 +248,15 @@ func (cc *CacheCoherent) flushExpired(nowUtc int64) {
 		}
 
 		cc.usage.Delete(ce.key)
+		atomic.AddInt64(&cc.usageCount, -1)
 	}
 }
 
+// Statistics returns a snapshot of cache statistics.
 func (cc *CacheCoherent) Statistics() CacheStatistics {
-	normal := &parallelCount{source: &cc.usage}
-	priorityQueueCount := cc.cpq.pq.Len()
-	countMap(normal)
-
 	statistics := CacheStatistics{
-		usageCount:  normal.count,
-		pqCount:     priorityQueueCount,
+		usageCount:  int(atomic.LoadInt64(&cc.usageCount)),
+		pqCount:     cc.cpq.Count(),
 		totalMisses: atomic.LoadInt64(&cc.stats.totalMisses),
 		totalHits:   atomic.LoadInt64(&cc.stats.totalHits),
 	}

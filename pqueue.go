@@ -8,30 +8,37 @@ import (
 	"container/heap"
 )
 
-// this is a priority queue as implemented by a min heap
-// the 0th element is the lowest value
+const defaultQueueCapacity = 512
+
+// priorityQueue is a priority queue implemented as a min heap.
+// The 0th element is the lowest value (earliest expiration).
 type priorityQueue []*cacheEntry
 
+// newPriorityQueue creates a new priority queue with the specified capacity.
 func newPriorityQueue(capacity int) *priorityQueue {
 	pq := make(priorityQueue, 0, capacity)
 	heap.Init(&pq)
 	return &pq
 }
 
+// Len returns the number of elements in the queue.
 func (pq *priorityQueue) Len() int {
 	return len(*pq)
 }
 
+// Less reports whether the element at index i should sort before the element at index j.
 func (pq *priorityQueue) Less(i, j int) bool {
-	return (*pq)[i].priority < (*pq)[j].priority
+	return (*pq)[i].getPriority() < (*pq)[j].getPriority()
 }
 
+// Swap swaps the elements at indexes i and j.
 func (pq *priorityQueue) Swap(i, j int) {
 	(*pq)[i], (*pq)[j] = (*pq)[j], (*pq)[i]
 	(*pq)[i].index = i
 	(*pq)[j].index = j
 }
 
+// Push adds an element to the queue.
 func (pq *priorityQueue) Push(x any) {
 	var (
 		n = pq.Len()
@@ -51,6 +58,7 @@ func (pq *priorityQueue) Push(x any) {
 	(*pq)[n] = ce
 }
 
+// Pop removes and returns the last element from the queue.
 func (pq *priorityQueue) Pop() any {
 	var (
 		n       = pq.Len()
@@ -59,7 +67,7 @@ func (pq *priorityQueue) Pop() any {
 		capHalf = c / 2
 	)
 
-	if n < capHalf && c > queueCapacity {
+	if n < capHalf && c > defaultQueueCapacity {
 		npq := make(priorityQueue, n, capHalf)
 		copy(npq, *pq)
 		*pq = npq
@@ -78,6 +86,10 @@ func (pq *priorityQueue) isEmpty() bool {
 	return pq.Len() == 0
 }
 
+// clear removes all elements and releases references to avoid memory leak.
 func (pq *priorityQueue) clear() {
+	for i := range *pq {
+		(*pq)[i] = nil
+	}
 	*pq = (*pq)[:0]
 }

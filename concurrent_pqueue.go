@@ -5,14 +5,15 @@ import (
 	"sync"
 )
 
+// ConcurrentPriorityQueue is a thread-safe priority queue.
 type ConcurrentPriorityQueue struct {
 	pq *priorityQueue
 	mu *sync.Mutex
 }
 
+// newConcurrentPriorityQueue creates a new ConcurrentPriorityQueue with the specified capacity.
 func newConcurrentPriorityQueue(capacity int) *ConcurrentPriorityQueue {
 	pq := newPriorityQueue(capacity)
-	heap.Init(pq)
 	cpq := ConcurrentPriorityQueue{
 		pq: pq,
 		mu: new(sync.Mutex),
@@ -27,7 +28,7 @@ func (cpq *ConcurrentPriorityQueue) enqueue(ce *cacheEntry) {
 	cpq.mu.Unlock()
 }
 
-// dequeue remove and return first element.
+// dequeue removes and returns the first element if its priority <= limit.
 func (cpq *ConcurrentPriorityQueue) dequeue(limit int64) (*cacheEntry, bool) {
 	cpq.mu.Lock()
 	defer cpq.mu.Unlock()
@@ -37,8 +38,7 @@ func (cpq *ConcurrentPriorityQueue) dequeue(limit int64) (*cacheEntry, bool) {
 	}
 
 	ce := (*cpq.pq)[0]
-	if ce.priority > limit {
-
+	if ce.getPriority() > limit {
 		return nil, false
 	}
 
@@ -47,29 +47,42 @@ func (cpq *ConcurrentPriorityQueue) dequeue(limit int64) (*cacheEntry, bool) {
 	return ce, true
 }
 
-// update modifies the element in the queue.
+// update modifies the element's position in the queue based on its new priority.
 func (cpq *ConcurrentPriorityQueue) update(ce *cacheEntry) {
 	cpq.mu.Lock()
+	defer cpq.mu.Unlock()
+
+	// boundary check to prevent panic
+	if ce.index < 0 || ce.index >= cpq.pq.Len() {
+		return
+	}
+
 	heap.Fix(cpq.pq, ce.index)
-	cpq.mu.Unlock()
 }
 
-// remove removes the element at index i from the heap.
+// remove removes the element from the heap.
 func (cpq *ConcurrentPriorityQueue) remove(ce *cacheEntry) {
 	cpq.mu.Lock()
 	defer cpq.mu.Unlock()
 
 	l := cpq.pq.Len()
-	if l == 0 || l <= ce.index || ce.index < 0 {
+	if l == 0 || ce.index < 0 || ce.index >= l {
 		return
 	}
 
 	heap.Remove(cpq.pq, ce.index)
 }
 
-// eraseMap removes all elements
+// erase removes all elements from the queue.
 func (cpq *ConcurrentPriorityQueue) erase() {
 	cpq.mu.Lock()
 	cpq.pq.clear()
 	cpq.mu.Unlock()
+}
+
+// Count returns the number of elements in the queue.
+func (cpq *ConcurrentPriorityQueue) Count() int {
+	cpq.mu.Lock()
+	defer cpq.mu.Unlock()
+	return cpq.pq.Len()
 }
