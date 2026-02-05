@@ -80,8 +80,8 @@ func Test_DataRace(t *testing.T) {
 				for i := 0; i < loop; i++ {
 					key := fmt.Sprintf("RightNow-1-%v", i)
 					if i%2 == 0 {
-						m.Inactive(key, struct{}{}, time.Second)
-						Default.Inactive(key, struct{}{}, time.Second)
+						m.Sliding(key, struct{}{}, time.Second)
+						Default.Sliding(key, struct{}{}, time.Second)
 					} else {
 						m.Delay(key, struct{}{}, time.Second)
 						Default.Delay(key, struct{}{}, time.Second)
@@ -152,9 +152,9 @@ func keep(loop int, m *CacheCoherent, swg *sync.WaitGroup, index int) {
 		key := fmt.Sprintf("QQ-%v-%v", i, index)
 		ttl := time.Duration(int64(100+i) * int64(time.Millisecond))
 		if i%2 == 0 {
-			m.Inactive(key, struct{}{}, ttl)
+			m.Sliding(key, struct{}{}, ttl)
 		} else {
-			m.Delay(key, struct{}{}, ttl)
+			m.Expire(key, struct{}{}, ttl)
 		}
 	}
 }
@@ -241,28 +241,28 @@ func Test_Default(t *testing.T) {
 			equal(t, int64(1), delayStat.totalMisses)
 			Default.Reset()
 
-			//----  Inactive ----
-			Default.Inactive(tt.args.key, tt.args.valInactive, timeBase)
+			//----  Sliding ----
+			Default.Sliding(tt.args.key, tt.args.valInactive, timeBase)
 			if val, ok := Default.Read(tt.args.key); ok {
 				equal(t, val, tt.args.valInactive)
 			} else {
-				t.Fatalf("Inactive can't read the key:%v", tt.args.key)
+				t.Fatalf("Sliding can't read the key:%v", tt.args.key)
 			}
 
 			<-time.After(time.Millisecond * 30)
 			if _, ok := Default.Read(tt.args.key); !ok {
-				t.Fatalf("after 30 ms Inactive can't read the key:%v", tt.args.key)
+				t.Fatalf("after 30 ms Sliding can't read the key:%v", tt.args.key)
 			}
 
 			<-time.After(timeBase)
 			if _, ok := Default.Read(tt.args.key); ok {
-				t.Fatalf("After flushExpired, the key can be read by Inactive:%v", tt.args.key)
+				t.Fatalf("After flushExpired, the key can be read by Sliding:%v", tt.args.key)
 			}
 
-			inactiveStat := Default.Statistics()
-			t.Logf("Inactive Statistics %+v", delayStat)
-			equal(t, int64(2), inactiveStat.totalHits)
-			equal(t, int64(1), inactiveStat.totalMisses)
+			slidingStat := Default.Statistics()
+			t.Logf("Sliding Statistics %+v", slidingStat)
+			equal(t, int64(2), slidingStat.totalHits)
+			equal(t, int64(1), slidingStat.totalMisses)
 			Default.Reset()
 		})
 	}

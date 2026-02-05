@@ -87,6 +87,10 @@ type (
 		cancelCtx context.Context
 		// cancel function for the context
 		cancelFunc context.CancelFunc
+		// for TimingWheel use: which level the entry is in (use atomic operations)
+		twLevel int32
+		// for TimingWheel use: which slot in the level (use atomic operations)
+		twSlot int32
 	}
 
 	// EntryOptions represents options for creating a cache entry.

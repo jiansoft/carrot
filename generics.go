@@ -38,9 +38,16 @@ func (tc *TypedCache[K, V]) Delay(key K, val V, ttl time.Duration) {
 	tc.Expire(key, val, ttl)
 }
 
-// Inactive stores an item that expires after it is inactive for more than a period of time.
+// Sliding stores an item with sliding expiration.
+// The item expires after it has not been accessed for the specified duration.
+// Each Read will reset the expiration timer.
+func (tc *TypedCache[K, V]) Sliding(key K, val V, sliding time.Duration) {
+	tc.cache.Sliding(key, val, sliding)
+}
+
+// Inactive is deprecated: Use Sliding instead.
 func (tc *TypedCache[K, V]) Inactive(key K, val V, inactive time.Duration) {
-	tc.cache.Inactive(key, val, inactive)
+	tc.Sliding(key, val, inactive)
 }
 
 // Set stores an item with the specified options.

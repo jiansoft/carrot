@@ -114,7 +114,7 @@ func BenchmarkSlidingExpiration(b *testing.B) {
 	cache := NewCache()
 	// Pre-populate cache with sliding items
 	for i := 0; i < 10000; i++ {
-		cache.Inactive(i, i, time.Hour)
+		cache.Sliding(i, i, time.Hour)
 	}
 	b.ResetTimer()
 
@@ -128,7 +128,7 @@ func BenchmarkSlidingExpirationParallel(b *testing.B) {
 	cache := NewCache()
 	// Pre-populate cache with sliding items
 	for i := 0; i < 10000; i++ {
-		cache.Inactive(i, i, time.Hour)
+		cache.Sliding(i, i, time.Hour)
 	}
 	b.ResetTimer()
 

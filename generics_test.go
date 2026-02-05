@@ -56,7 +56,19 @@ func TestTypedCacheUntil(t *testing.T) {
 	}
 }
 
-// TestTypedCacheInactive tests Inactive method.
+// TestTypedCacheSliding tests Sliding method.
+func TestTypedCacheSliding(t *testing.T) {
+	cache := NewTypedCache[string, string]()
+
+	cache.Sliding("key", "value", time.Hour)
+
+	val, ok := cache.Read("key")
+	if !ok || val != "value" {
+		t.Errorf("Read('key') = %s, %v; want 'value', true", val, ok)
+	}
+}
+
+// TestTypedCacheInactive tests Inactive (deprecated) method.
 func TestTypedCacheInactive(t *testing.T) {
 	cache := NewTypedCache[string, string]()
 

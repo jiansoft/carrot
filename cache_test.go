@@ -116,7 +116,44 @@ func TestSetScanFrequencyNegative(t *testing.T) {
 	}
 }
 
-// TestInactiveNegative tests Inactive with negative duration.
+// TestSlidingBasic tests Sliding expiration basic functionality.
+func TestSlidingBasic(t *testing.T) {
+	cache := NewCache()
+	defer cache.Reset()
+
+	cache.Sliding("test-key", "value", time.Hour)
+
+	val, ok := cache.Read("test-key")
+	if !ok || val != "value" {
+		t.Error("Sliding should store the item")
+	}
+}
+
+// TestSlidingNegative tests Sliding with negative duration.
+func TestSlidingNegative(t *testing.T) {
+	cache := NewCache()
+	defer cache.Reset()
+
+	cache.Sliding("test-key", "value", -time.Second)
+
+	if cache.Have("test-key") {
+		t.Error("Sliding with negative duration should not store the item")
+	}
+}
+
+// TestSlidingZero tests Sliding with zero duration.
+func TestSlidingZero(t *testing.T) {
+	cache := NewCache()
+	defer cache.Reset()
+
+	cache.Sliding("test-key", "value", 0)
+
+	if cache.Have("test-key") {
+		t.Error("Sliding with zero duration should not store the item")
+	}
+}
+
+// TestInactiveNegative tests Inactive (deprecated) with negative duration.
 func TestInactiveNegative(t *testing.T) {
 	cache := NewCache()
 	defer cache.Reset()
@@ -128,7 +165,7 @@ func TestInactiveNegative(t *testing.T) {
 	}
 }
 
-// TestInactiveZero tests Inactive with zero duration.
+// TestInactiveZero tests Inactive (deprecated) with zero duration.
 func TestInactiveZero(t *testing.T) {
 	cache := NewCache()
 	defer cache.Reset()

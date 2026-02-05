@@ -110,14 +110,25 @@ func (cc *CacheCoherent) Delay(key, val any, ttl time.Duration) {
 	cc.Expire(key, val, ttl)
 }
 
-// Inactive stores an item that expires after it is inactive for more than a period of time.
-// Each read will reset the expiration timer. Does nothing if inactive is not positive.
-func (cc *CacheCoherent) Inactive(key, val any, inactive time.Duration) {
-	if inactive <= 0 {
+// Sliding stores an item with sliding expiration.
+// The item expires after it has not been accessed for the specified duration.
+// Each Read will reset the expiration timer. Does nothing if duration is not positive.
+//
+// Example:
+//
+//	cache.Sliding("session", userData, 30*time.Minute)
+//	// Item expires 30 minutes after last access
+func (cc *CacheCoherent) Sliding(key, val any, sliding time.Duration) {
+	if sliding <= 0 {
 		return
 	}
 
-	cc.keep(key, val, entryOptions{SlidingExpiration: inactive})
+	cc.keep(key, val, entryOptions{SlidingExpiration: sliding})
+}
+
+// Inactive is deprecated: Use Sliding instead.
+func (cc *CacheCoherent) Inactive(key, val any, inactive time.Duration) {
+	cc.Sliding(key, val, inactive)
 }
 
 // Set stores an item with the specified options.
