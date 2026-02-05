@@ -13,7 +13,7 @@
 
 - **多種過期策略** - 絕對時間過期、滑動過期、永不過期
 - **執行緒安全** - 使用 `sync.Map` 和 `sync.Mutex` 確保並發存取安全
-- **優先級佇列** - 使用最小堆積實現高效的過期項目自動清理
+- **混合型過期管理** - 短 TTL 使用時間輪（批次過期）+ 長 TTL 使用分片優先佇列（高效單項操作）
 - **快取統計** - 追蹤命中率、未命中率及使用量
 - **單例與自訂實例** - 可使用預設全域實例或建立獨立實例
 - **GetOrCreate 模式** - 原子性的取得或建立操作（類似 .NET 的 GetOrCreate）
@@ -29,7 +29,7 @@
 go get github.com/jiansoft/carrot
 ```
 
-需要 Go 1.19 或更高版本。
+需要 Go 1.22 或更高版本。
 
 ## 快速開始
 
@@ -73,7 +73,7 @@ func main() {
 | `Forever(key, val any)` | 儲存永不過期的項目 |
 | `Expire(key, val any, ttl time.Duration)` | 儲存指定時間後過期的項目。使用負數表示永不過期 |
 | `Until(key, val any, until time.Time)` | 儲存在指定時間點過期的項目 |
-| `Inactive(key, val any, inactive time.Duration)` | 儲存滑動過期的項目（每次存取會重置過期時間） |
+| `Sliding(key, val any, sliding time.Duration)` | 儲存滑動過期的項目（每次存取會重置過期時間）。duration ≤ 0 時不執行任何操作 |
 | `Set(key, val any, options EntryOptions)` | 使用完整選項儲存項目 |
 
 ### 讀取操作
@@ -110,6 +110,11 @@ func main() {
 | `GetSizeLimit() int64` | 取得目前的大小限制 |
 | `GetCurrentSize() int64` | 取得所有項目的目前總大小 |
 | `Statistics() CacheStatistics` | 取得快取統計資訊（命中、未命中、數量） |
+| `SetExpirationStrategy(s ExpirationStrategy)` | 設定過期策略（Auto/TimingWheel/PriorityQueue） |
+| `SetShortTTLThreshold(d time.Duration)` | 設定短 TTL 閾值（預設：1 小時） |
+| `ExpirationStats() ExpirationManagerStats` | 取得詳細的過期統計資訊 |
+| `ShrinkExpirationQueue()` | 整理內部優先佇列的記憶體碎片 |
+| `Stop()` | 停止背景過期 goroutine（使用完畢時呼叫） |
 
 ## EntryOptions
 
@@ -297,7 +302,7 @@ carrot.Default.Until("daily-cache", data, midnight)
 
 ```go
 // 最後一次存取後 10 分鐘過期
-carrot.Default.Inactive("user-session", userData, 10*time.Minute)
+carrot.Default.Sliding("user-session", userData, 10*time.Minute)
 
 // 每次讀取都會重置 10 分鐘的計時器
 val, _ := carrot.Default.Read("user-session")
@@ -315,6 +320,52 @@ carrot.Default.Forever("config", configData)
 carrot.Default.Expire("settings", settings, -time.Second)
 ```
 
+## 過期管理
+
+Carrot 使用混合型方式管理過期：
+
+| 資料結構 | TTL 範圍 | 特性 |
+|----------|----------|------|
+| **時間輪 (TimingWheel)** | ≤ 閾值（預設：1 小時） | O(1) 批次過期，適合高頻率短 TTL |
+| **分片優先佇列 (ShardedPriorityQueue)** | > 閾值 | O(log n) 單項操作，適合長 TTL |
+| **無** | 永久 | 項目不放入任何過期佇列 |
+
+### 設定過期策略
+
+```go
+// 選項 1：調整閾值（預設：1 小時）
+// TTL ≤ 5 分鐘 → 時間輪，TTL > 5 分鐘 → 分片優先佇列
+cache.SetShortTTLThreshold(5 * time.Minute)
+
+// 選項 2：強制使用特定策略
+cache.SetExpirationStrategy(carrot.StrategyTimingWheel)    // 所有項目使用時間輪
+cache.SetExpirationStrategy(carrot.StrategyPriorityQueue)  // 所有項目使用分片優先佇列
+cache.SetExpirationStrategy(carrot.StrategyAuto)           // 根據 TTL 自動選擇（預設）
+
+// 查看統計
+emStats := cache.ExpirationStats()
+fmt.Printf("短 TTL 比例: %.2f%%\n",
+    float64(emStats.TwAddCount) / float64(emStats.TwAddCount + emStats.SpqAddCount) * 100)
+```
+
+### 建議的閾值設定
+
+| 使用場景 | 建議閾值 | 說明 |
+|----------|----------|------|
+| 一般用途 | 1 小時（預設） | 平衡效能 |
+| 高頻率短 TTL | 5-15 分鐘 | 更多項目使用時間輪 |
+| 主要為長 TTL | 24 小時 | 幾乎全部使用分片優先佇列 |
+| 超短 TTL | 1 分鐘 | 只有非常短的 TTL 使用時間輪 |
+
+### 資源清理
+
+使用完快取後，呼叫 `Stop()` 釋放背景 goroutine：
+
+```go
+cache := carrot.NewCache()
+defer cache.Stop()  // 釋放時間輪 goroutine
+```
+
 ## 使用自訂實例
 
 為不同用途建立獨立的快取實例。
@@ -329,7 +380,7 @@ dataCache := carrot.New[string, QueryResult]()
 dataCache.SetScanFrequency(5 * time.Minute)
 
 // 以型別安全的方式獨立使用
-sessionCache.Inactive("user:123", session, 30*time.Minute)
+sessionCache.Sliding("user:123", session, 30*time.Minute)
 dataCache.Expire("query:result", result, time.Hour)
 
 // 或建立非型別化的快取以保持向後相容
@@ -346,7 +397,8 @@ stats := carrot.Default.Statistics()
 fmt.Printf("總命中次數: %d\n", stats.TotalHits())
 fmt.Printf("總未命中次數: %d\n", stats.TotalMisses())
 fmt.Printf("目前項目數: %d\n", stats.UsageCount())
-fmt.Printf("佇列大小: %d\n", stats.PqCount())
+fmt.Printf("時間輪項目數: %d\n", stats.TwCount())    // 短 TTL 項目
+fmt.Printf("優先佇列項目數: %d\n", stats.PqCount())  // 長 TTL 項目
 
 // 計算命中率
 total := stats.TotalHits() + stats.TotalMisses()
@@ -354,6 +406,12 @@ if total > 0 {
     hitRate := float64(stats.TotalHits()) / float64(total) * 100
     fmt.Printf("命中率: %.2f%%\n", hitRate)
 }
+
+// 詳細的過期統計
+emStats := carrot.Default.ExpirationStats()
+fmt.Printf("時間輪過期數: %d\n", emStats.TwExpireCount)
+fmt.Printf("優先佇列過期數: %d\n", emStats.SpqExpireCount)
+fmt.Printf("永久項目數: %d\n", emStats.ForeverCount)
 ```
 
 ## 執行緒安全
@@ -361,9 +419,10 @@ if total > 0 {
 Carrot 專為並發使用而設計：
 
 - `sync.Map` 用於無鎖的快取項目儲存
-- `sync.RWMutex` 保護優先級佇列操作（允許並發讀取）
+- 分片優先佇列使用每分片獨立鎖，提高並發性能
+- 時間輪使用槽位級別的鎖，實現高效的批次過期
 - `atomic` 操作用於快取項目欄位（優先級、過期時間、統計資訊）
-- 使用 atomic compare-and-swap 實現無鎖讀取和更新
+- CAS（Compare-And-Swap）確保回調只執行一次
 - 背景清理非同步執行，不會阻塞讀寫操作
 
 ## 效能
@@ -374,10 +433,11 @@ Carrot 針對高效能場景進行了優化，效能可與 .NET MemoryCache 比�
 |------|------|-----------|
 | 讀取 | ~35-52 ns/op | 0 |
 | 讀取（並行） | ~35 ns/op | 0 |
-| 寫入（Expire） | ~476 ns/op | 4 |
+| 寫入（Expire） | ~350-476 ns/op | 4 |
 | GetOrCreate | ~32-52 ns/op | 1 |
-| Forget | ~655 ns/op | 0 |
+| Forget | ~185-655 ns/op | 0 |
 | 高競爭讀取 | ~35 ns/op | 0 |
+| 批次過期（時間輪） | ~34 μs/1000 項目 | - |
 
 ### 與 .NET MemoryCache 的比較
 

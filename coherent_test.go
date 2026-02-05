@@ -39,7 +39,8 @@ func Test_CacheCoherent(t *testing.T) {
 			s := tt.memoryCache.Statistics()
 			t.Logf("Statistics %+v", s)
 			equal(t, s.usageCount, 0)
-			equal(t, s.usageCount, s.pqCount)
+			// 所有項目都被 Forget 了，pqCount 和 twCount 都應該是 0
+			equal(t, s.pqCount+s.twCount, 0)
 			tt.memoryCache.Reset()
 
 			tt.memoryCache.Forget("noKey")
@@ -57,7 +58,9 @@ func Test_CacheCoherent(t *testing.T) {
 			s = tt.memoryCache.Statistics()
 			t.Logf("Statistics %+v", s)
 			equal(t, s.usageCount, tt.want)
-			equal(t, s.usageCount, s.pqCount)
+			// 1 小時 TTL 項目會進入 TimingWheel（TTL <= 閾值）
+			// usageCount 應該等於 pqCount + twCount
+			equal(t, s.usageCount, s.pqCount+s.twCount)
 		})
 	}
 }
@@ -187,83 +190,91 @@ func Test_Default(t *testing.T) {
 		}},
 	}
 	var timeBase = time.Millisecond * 50
-	Default.SetScanFrequency(timeBase * 2)
-	Default.Reset()
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			Default.Forever(tt.args.key, tt.args.val)
-			if val, ok := Default.Read(tt.args.key); ok {
+			// 使用獨立的 cache 實例，避免跨測試統計累計問題
+			// 設計文件 Section 5.3.6: Reset 不重置 totalHits/totalMisses
+			cache := newCacheCoherent()
+			cache.SetScanFrequency(timeBase * 2)
+
+			//----  Forever ----
+			cache.Forever(tt.args.key, tt.args.val)
+			if val, ok := cache.Read(tt.args.key); ok {
 				equal(t, val, tt.args.val)
 			} else {
 				t.Fatalf("Forever can't read the key:%v", tt.args.key)
 			}
-			foreverStat := Default.Statistics()
+			foreverStat := cache.Statistics()
 			t.Logf("Forever Statistics %+v", foreverStat)
 			equal(t, int64(1), foreverStat.totalHits)
 			equal(t, int64(0), foreverStat.totalMisses)
-			Default.Reset()
+			cache.Reset()
 
 			//----  Until ----
-			Default.Until(tt.args.key, tt.args.valUntil, time.Now().Add(timeBase))
-			if val, ok := Default.Read(tt.args.key); ok {
+			cache.Until(tt.args.key, tt.args.valUntil, time.Now().Add(timeBase))
+			if val, ok := cache.Read(tt.args.key); ok {
 				equal(t, val, tt.args.valUntil)
 			} else {
 				t.Fatalf("Until can't read the key:%v", tt.args.key)
 			}
 
 			<-time.After(timeBase)
-			Default.flushExpired(time.Now().UTC().UnixNano())
-			if _, ok := Default.Read(tt.args.key); ok {
+			cache.flushExpired(time.Now().UTC().UnixNano())
+			if _, ok := cache.Read(tt.args.key); ok {
 				t.Fatalf("After calling flushExpired, Until can read the key:%v", tt.args.key)
 			}
-			untilStat := Default.Statistics()
+			untilStat := cache.Statistics()
 			t.Logf("Until Statistics %+v", untilStat)
-			equal(t, int64(1), untilStat.totalHits)
+			// 累計值：之前 1 hit + 這次 1 hit = 2 hits; 這次 1 miss
+			equal(t, int64(2), untilStat.totalHits)
 			equal(t, int64(1), untilStat.totalMisses)
-			Default.Reset()
+			cache.Reset()
 
 			//----  Delay ----
-			Default.Delay(tt.args.key, tt.args.valDelay, timeBase)
-			if val, ok := Default.Read(tt.args.key); ok {
+			cache.Delay(tt.args.key, tt.args.valDelay, timeBase)
+			if val, ok := cache.Read(tt.args.key); ok {
 				equal(t, val, tt.args.valDelay)
 			} else {
 				t.Fatalf("Delay can't read the key:%v", tt.args.key)
 			}
 
 			<-time.After(timeBase)
-			Default.flushExpired(time.Now().UTC().UnixNano())
-			if _, ok := Default.Read(tt.args.key); ok {
+			cache.flushExpired(time.Now().UTC().UnixNano())
+			if _, ok := cache.Read(tt.args.key); ok {
 				t.Fatalf("After flushExpired, the key can be read by Delay:%v", tt.args.key)
 			}
-			delayStat := Default.Statistics()
+			delayStat := cache.Statistics()
 			t.Logf("Delay Statistics %+v", delayStat)
-			equal(t, int64(1), delayStat.totalHits)
-			equal(t, int64(1), delayStat.totalMisses)
-			Default.Reset()
+			// 累計值：之前 2 hits + 這次 1 hit = 3 hits; 之前 1 miss + 這次 1 miss = 2 misses
+			equal(t, int64(3), delayStat.totalHits)
+			equal(t, int64(2), delayStat.totalMisses)
+			cache.Reset()
 
 			//----  Sliding ----
-			Default.Sliding(tt.args.key, tt.args.valInactive, timeBase)
-			if val, ok := Default.Read(tt.args.key); ok {
+			cache.Sliding(tt.args.key, tt.args.valInactive, timeBase)
+			if val, ok := cache.Read(tt.args.key); ok {
 				equal(t, val, tt.args.valInactive)
 			} else {
 				t.Fatalf("Sliding can't read the key:%v", tt.args.key)
 			}
 
 			<-time.After(time.Millisecond * 30)
-			if _, ok := Default.Read(tt.args.key); !ok {
+			if _, ok := cache.Read(tt.args.key); !ok {
 				t.Fatalf("after 30 ms Sliding can't read the key:%v", tt.args.key)
 			}
 
 			<-time.After(timeBase)
-			if _, ok := Default.Read(tt.args.key); ok {
+			if _, ok := cache.Read(tt.args.key); ok {
 				t.Fatalf("After flushExpired, the key can be read by Sliding:%v", tt.args.key)
 			}
 
-			slidingStat := Default.Statistics()
+			slidingStat := cache.Statistics()
 			t.Logf("Sliding Statistics %+v", slidingStat)
-			equal(t, int64(2), slidingStat.totalHits)
-			equal(t, int64(1), slidingStat.totalMisses)
-			Default.Reset()
+			// 累計值：之前 3 hits + 這次 2 hits = 5 hits; 之前 2 misses + 這次 1 miss = 3 misses
+			equal(t, int64(5), slidingStat.totalHits)
+			equal(t, int64(3), slidingStat.totalMisses)
+			cache.Reset()
 		})
 	}
 }

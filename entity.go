@@ -91,6 +91,15 @@ type (
 		twLevel int32
 		// for TimingWheel use: which slot in the level (use atomic operations)
 		twSlot int32
+		// expirationSource 標記項目在哪個資料結構中
+		// 0 = 未設定/Forever, 1 = TimingWheel, 2 = ShardedPriorityQueue
+		// (use atomic operations)
+		expirationSource int32
+		// spqDirtyMarked 標記是否已經在 SPQ 中增加了 dirtyCount
+		// 用於防止並發窗口導致 dirtyCount 被重複增加
+		// 0 = 未標記, 1 = 已標記
+		// (use atomic operations with CAS)
+		spqDirtyMarked int32
 	}
 
 	// EntryOptions represents options for creating a cache entry.

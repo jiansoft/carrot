@@ -154,6 +154,29 @@ func (tc *TypedCache[K, V]) Statistics() CacheStatistics {
 	return tc.cache.Statistics()
 }
 
+// SetExpirationStrategy sets the routing strategy for expiration management.
+// See ExpirationStrategy for available options.
+func (tc *TypedCache[K, V]) SetExpirationStrategy(s ExpirationStrategy) {
+	tc.cache.SetExpirationStrategy(s)
+}
+
+// SetShortTTLThreshold sets the threshold for routing items to TimingWheel.
+// Items with TTL <= threshold go to TimingWheel, others go to ShardedPriorityQueue.
+func (tc *TypedCache[K, V]) SetShortTTLThreshold(d time.Duration) {
+	tc.cache.SetShortTTLThreshold(d)
+}
+
+// ExpirationStats returns statistics from the expiration manager.
+func (tc *TypedCache[K, V]) ExpirationStats() ExpirationManagerStats {
+	return tc.cache.ExpirationStats()
+}
+
+// ShrinkExpirationQueue performs defragmentation on the internal priority queue.
+// See CacheCoherent.ShrinkExpirationQueue for details.
+func (tc *TypedCache[K, V]) ShrinkExpirationQueue() {
+	tc.cache.ShrinkExpirationQueue()
+}
+
 // Underlying returns the underlying CacheCoherent instance.
 // Use this for advanced operations not covered by the typed API.
 func (tc *TypedCache[K, V]) Underlying() *CacheCoherent {

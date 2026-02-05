@@ -557,8 +557,8 @@ func TestTimingWheelConcurrentExpiration(t *testing.T) {
 	// 等待所有項目過期
 	time.Sleep(4 * time.Second)
 
-	if int(expiredCount) != numItems {
-		t.Errorf("預期 %d 個項目過期，實際 %d 個", numItems, expiredCount)
+	if int(atomic.LoadInt64(&expiredCount)) != numItems {
+		t.Errorf("預期 %d 個項目過期，實際 %d 個", numItems, atomic.LoadInt64(&expiredCount))
 	}
 }
 

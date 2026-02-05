@@ -2,6 +2,7 @@ package carrot
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -182,9 +183,14 @@ func TestCacheStatisticsGetters(t *testing.T) {
 	cache := NewCache()
 	defer cache.Reset()
 
-	// Add some items and perform operations
+	// Add Forever items (not in any queue)
 	cache.Forever("key1", "value1")
 	cache.Forever("key2", "value2")
+
+	// Add items with TTL (will be in TimingWheel or PriorityQueue based on TTL)
+	// Short TTL (<=1h) goes to TimingWheel, Long TTL (>1h) goes to PriorityQueue
+	cache.Expire("key3", "value3", 30*time.Minute) // Short TTL → TimingWheel
+	cache.Expire("key4", "value4", 2*time.Hour)    // Long TTL → PriorityQueue
 
 	// Hit
 	cache.Read("key1")
@@ -203,12 +209,19 @@ func TestCacheStatisticsGetters(t *testing.T) {
 		t.Errorf("TotalMisses() = %d, want 1", stats.TotalMisses())
 	}
 
-	if stats.UsageCount() != 2 {
-		t.Errorf("UsageCount() = %d, want 2", stats.UsageCount())
+	if stats.UsageCount() != 4 {
+		t.Errorf("UsageCount() = %d, want 4", stats.UsageCount())
 	}
 
-	if stats.PqCount() != 2 {
-		t.Errorf("PqCount() = %d, want 2", stats.PqCount())
+	// Forever items are not in any queue
+	// Short TTL items go to TimingWheel
+	// Long TTL items go to PriorityQueue
+	if stats.TwCount() != 1 {
+		t.Errorf("TwCount() = %d, want 1", stats.TwCount())
+	}
+
+	if stats.PqCount() != 1 {
+		t.Errorf("PqCount() = %d, want 1", stats.PqCount())
 	}
 }
 
@@ -226,7 +239,8 @@ func TestForgetNonexistent(t *testing.T) {
 	}
 }
 
-// TestResetClearsEverything tests that Reset clears all items and statistics.
+// TestResetClearsEverything tests that Reset clears cache items but preserves statistics.
+// 設計文件 Section 5.3.6: Reset 只清空快取內容，不重置 totalHits/totalMisses
 func TestResetClearsEverything(t *testing.T) {
 	cache := NewCache()
 
@@ -235,16 +249,20 @@ func TestResetClearsEverything(t *testing.T) {
 	cache.Read("key1")
 	cache.Read("nonexistent")
 
+	statsBefore := cache.Statistics()
+
 	cache.Reset()
 
 	stats := cache.Statistics()
 
-	if stats.TotalHits() != 0 {
-		t.Error("Reset should clear totalHits")
+	// Reset 不應清除 totalHits/totalMisses（設計文件要求）
+	if stats.TotalHits() != statsBefore.TotalHits() {
+		t.Errorf("Reset should preserve totalHits, got %d want %d", stats.TotalHits(), statsBefore.TotalHits())
 	}
-	if stats.TotalMisses() != 0 {
-		t.Error("Reset should clear totalMisses")
+	if stats.TotalMisses() != statsBefore.TotalMisses() {
+		t.Errorf("Reset should preserve totalMisses, got %d want %d", stats.TotalMisses(), statsBefore.TotalMisses())
 	}
+	// Reset 應清除 usageCount 和 pqCount
 	if stats.UsageCount() != 0 {
 		t.Error("Reset should clear usageCount")
 	}
@@ -558,13 +576,13 @@ func TestSet(t *testing.T) {
 	cache := NewCache()
 	defer cache.Reset()
 
-	callbackCalled := false
+	var callbackCalled atomic.Bool
 	cache.Set("key", "value", EntryOptions{
 		TimeToLive: time.Hour,
 		Priority:   PriorityHigh,
 		Size:       100,
 		PostEvictionCallback: func(key, value any, reason EvictionReason) {
-			callbackCalled = true
+			callbackCalled.Store(true)
 		},
 	})
 
@@ -580,7 +598,7 @@ func TestSet(t *testing.T) {
 	cache.Set("key", "new-value", EntryOptions{TimeToLive: time.Hour})
 	time.Sleep(10 * time.Millisecond) // Allow async callback
 
-	if !callbackCalled {
+	if !callbackCalled.Load() {
 		t.Error("PostEvictionCallback should be called when item is replaced")
 	}
 }
@@ -617,13 +635,13 @@ func TestPostEvictionCallbackReason(t *testing.T) {
 	cache := NewCache()
 	defer cache.Reset()
 
-	var receivedReason EvictionReason
-	var receivedKey, receivedValue any
+	var receivedReason atomic.Int32
+	var receivedKey, receivedValue atomic.Value
 
 	callback := func(key, value any, reason EvictionReason) {
-		receivedKey = key
-		receivedValue = value
-		receivedReason = reason
+		receivedKey.Store(key)
+		receivedValue.Store(value)
+		receivedReason.Store(int32(reason))
 	}
 
 	// Test EvictionReasonRemoved
@@ -634,14 +652,14 @@ func TestPostEvictionCallbackReason(t *testing.T) {
 	cache.Forget("key1")
 	time.Sleep(20 * time.Millisecond)
 
-	if receivedReason != EvictionReasonRemoved {
-		t.Errorf("Reason = %v, want EvictionReasonRemoved", receivedReason)
+	if EvictionReason(receivedReason.Load()) != EvictionReasonRemoved {
+		t.Errorf("Reason = %v, want EvictionReasonRemoved", EvictionReason(receivedReason.Load()))
 	}
-	if receivedKey != "key1" {
-		t.Errorf("Key = %v, want 'key1'", receivedKey)
+	if receivedKey.Load() != "key1" {
+		t.Errorf("Key = %v, want 'key1'", receivedKey.Load())
 	}
-	if receivedValue != "value1" {
-		t.Errorf("Value = %v, want 'value1'", receivedValue)
+	if receivedValue.Load() != "value1" {
+		t.Errorf("Value = %v, want 'value1'", receivedValue.Load())
 	}
 
 	// Test EvictionReasonReplaced
@@ -652,8 +670,8 @@ func TestPostEvictionCallbackReason(t *testing.T) {
 	cache.Set("key2", "value2-new", EntryOptions{TimeToLive: time.Hour})
 	time.Sleep(20 * time.Millisecond)
 
-	if receivedReason != EvictionReasonReplaced {
-		t.Errorf("Reason = %v, want EvictionReasonReplaced", receivedReason)
+	if EvictionReason(receivedReason.Load()) != EvictionReasonReplaced {
+		t.Errorf("Reason = %v, want EvictionReasonReplaced", EvictionReason(receivedReason.Load()))
 	}
 }
 
@@ -662,10 +680,10 @@ func TestSizeLimitEviction(t *testing.T) {
 	cache := NewCache()
 	defer cache.Reset()
 
-	evictedCount := 0
+	var evictedCount atomic.Int64
 	callback := func(key, value any, reason EvictionReason) {
 		if reason == EvictionReasonCapacity {
-			evictedCount++
+			evictedCount.Add(1)
 		}
 	}
 
@@ -678,7 +696,7 @@ func TestSizeLimitEviction(t *testing.T) {
 	time.Sleep(20 * time.Millisecond)
 
 	// At least one item should have been evicted
-	if evictedCount == 0 {
+	if evictedCount.Load() == 0 {
 		t.Error("Size limit should trigger eviction")
 	}
 }

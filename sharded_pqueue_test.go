@@ -183,8 +183,8 @@ func TestShardedPriorityQueueCompact(t *testing.T) {
 		t.Errorf("ActiveCount() = %d before compact, want 50", activeBeforeCompact)
 	}
 
-	// Compact
-	spq.Compact()
+	// Shrink (internal memory defrag)
+	spq.shrink()
 
 	// After compact, deleted entries should be removed
 	afterCompact := spq.Count()

@@ -294,10 +294,19 @@ func (tw *TimingWheel) cascade(levelIdx int) {
 
 // expireSlot 處理槽中所有過期的項目
 //
+// 精確計數架構（Section 9.2.4）：
+// 1. 取出槽時立即批量預扣 totalCount
+// 2. Sliding 項目 reschedule 成功時補回 totalCount
+// 3. em.Remove 不操作 TW count（只負責 CAS）
+//
 // 這個方法會：
 // 1. 鎖定槽並取出所有項目
-// 2. 建立新的空 map 替換舊的（避免長時間持鎖）
-// 3. 對每個未被刪除的項目調用過期回調
+// 2. 批量預扣 totalCount（entries 離開槽位）
+// 3. 標記項目已被取出（twLevel = -1）
+// 4. 對每個項目：
+//   - 如果 deleted=1，跳過（計數已預扣）
+//   - 如果是 Sliding 項目且尚未過期，重新排程（reschedule 會補回計數）
+//   - 否則調用過期回調（不操作計數，已預扣）
 //
 // 參數：
 //   - slot: 要處理的槽
@@ -305,15 +314,108 @@ func (tw *TimingWheel) expireSlot(slot *twSlot) {
 	slot.mu.Lock()
 	entries := slot.entries
 	slot.entries = make(map[*cacheEntry]struct{}, 8)
+	count := len(entries)
 	slot.mu.Unlock()
 
-	for ce := range entries {
-		atomic.AddInt64(&tw.totalCount, -1)
-		// 只處理未被標記刪除的項目
-		if atomic.LoadInt32(&ce.deleted) == 0 {
-			tw.onExpired(ce)
-		}
+	// 精確計數：entries 離開槽位時立即批量扣減
+	// 這確保 tw.Count() 反映「正在槽位中等待」的真實數量
+	if count > 0 {
+		atomic.AddInt64(&tw.totalCount, -int64(count))
 	}
+
+	now := time.Now().UnixNano()
+
+	for ce := range entries {
+		// 標記項目已被從槽中取出
+		// 這樣 Remove 就知道不需要再從槽中刪除（已被取出且計數已扣）
+		atomic.StoreInt32(&ce.twLevel, -1)
+
+		// 已標記刪除，直接跳過
+		// 注意：totalCount 已在上面批量扣減，這裡不需要再扣
+		if atomic.LoadInt32(&ce.deleted) == 1 {
+			continue
+		}
+
+		// Sliding Expiration 的 Lazy 檢查
+		if ce.isSliding() {
+			lastAccessed := ce.getLastAccessed()
+			actualExpireAt := lastAccessed + int64(ce.slidingExpiration)
+			if actualExpireAt > now {
+				// 還沒真正過期，重新放入時間輪
+				// reschedule 成功時會 totalCount++（entry 重新進入輪子）
+				ce.setPriority(actualExpireAt)
+				ce.setAbsoluteExpiration(actualExpireAt)
+				tw.reschedule(ce)
+				continue
+			}
+		}
+
+		// 真的過期了，調用回調
+		// 注意：這裡「不做 CAS」，CAS 權限收斂在 removeEntry -> em.Remove
+		// em.Remove 只負責 CAS，不操作 TW totalCount（已在上面扣過）
+		tw.onExpired(ce)
+	}
+}
+
+// reschedule 將項目重新放入時間輪（expireSlot 中的重排場景）
+//
+// 精確計數架構（Section 9.2.4）：
+// - expireSlot 已經批量預扣了 totalCount
+// - 這裡成功放入新槽時需要補回 totalCount
+// - 如果 deleted=1 或已過期，不補回（視為真正離開輪子）
+//
+// 競態安全性說明：
+// 在 expireSlot 檢查 deleted 到呼叫 reschedule 之間，
+// 可能有其他 goroutine 呼叫 em.Remove() 並設定 deleted=1。
+// 此時應該放棄重排，不補回計數。
+//
+// 參數：
+//   - ce: 要重新排程的快取項目
+func (tw *TimingWheel) reschedule(ce *cacheEntry) {
+	expireAt := ce.getPriority()
+	now := time.Now().UnixNano()
+	delayMs := (expireAt - now) / int64(time.Millisecond)
+
+	if delayMs <= 0 {
+		// 已經過期，調用回調（不做 CAS，由 removeEntry 處理）
+		// 注意：totalCount 已在 expireSlot 取出時扣過，這裡不需要再扣
+		tw.onExpired(ce)
+		return
+	}
+
+	// Double-check: 放入新槽之前檢查 deleted
+	// 如果已被 em.Remove() 刪除，直接返回
+	// 注意：totalCount 已在 expireSlot 取出時扣過，這裡不需要再扣
+	if atomic.LoadInt32(&ce.deleted) == 1 {
+		return
+	}
+
+	levelIdx, offset := tw.calculateSlot(delayMs)
+
+	level := tw.levels[levelIdx]
+	current := atomic.LoadInt64(&level.current)
+	targetSlot := (current + offset) % level.size
+	if targetSlot < 0 {
+		targetSlot += level.size
+	}
+
+	slot := level.slots[targetSlot]
+	slot.mu.Lock()
+	// 在持有鎖的情況下最終檢查
+	if atomic.LoadInt32(&ce.deleted) == 1 {
+		slot.mu.Unlock()
+		// totalCount 已在 expireSlot 取出時扣過，這裡不需要再扣
+		return
+	}
+	slot.entries[ce] = struct{}{}
+	slot.mu.Unlock()
+
+	// 精確計數：entry 重新進入輪子，totalCount++
+	// 這補回 expireSlot 預扣的計數
+	atomic.AddInt64(&tw.totalCount, 1)
+
+	atomic.StoreInt32(&ce.twLevel, int32(levelIdx))
+	atomic.StoreInt32(&ce.twSlot, int32(targetSlot))
 }
 
 // Add 將項目加入時間輪排程
@@ -336,8 +438,11 @@ func (tw *TimingWheel) Add(ce *cacheEntry) bool {
 		return false
 	}
 
-	tw.addToWheel(ce)
-	atomic.AddInt64(&tw.totalCount, 1)
+	// 只有真正入槽才計數
+	// addToWheel 回傳 false 表示已過期，直接觸發回調而未入槽
+	if tw.addToWheel(ce) {
+		atomic.AddInt64(&tw.totalCount, 1)
+	}
 	return true
 }
 
@@ -345,8 +450,8 @@ func (tw *TimingWheel) Add(ce *cacheEntry) bool {
 //
 // 計算邏輯：
 // 1. 計算項目的延遲時間（過期時間 - 現在時間）
-// 2. 如果已過期，直接調用回調
-// 3. 否則根據延遲時間選擇適當的層級和槽
+// 2. 如果已過期，直接調用回調並回傳 false
+// 3. 否則根據延遲時間選擇適當的層級和槽，回傳 true
 //
 // 槽位計算：
 // - 對於 delayMs 毫秒後過期的項目
@@ -355,18 +460,22 @@ func (tw *TimingWheel) Add(ce *cacheEntry) bool {
 //
 // 參數：
 //   - ce: 要加入的快取項目
-func (tw *TimingWheel) addToWheel(ce *cacheEntry) {
+//
+// 回傳：
+//   - true: 成功放入槽位
+//   - false: 已過期，直接觸發回調而未入槽
+func (tw *TimingWheel) addToWheel(ce *cacheEntry) bool {
 	// 取得過期時間（Unix 納秒）
 	expireAt := ce.getPriority()
 	now := time.Now().UnixNano()
 	delayMs := (expireAt - now) / int64(time.Millisecond)
 
-	// 已過期，直接處理
+	// 已過期，直接處理，不入槽
 	if delayMs <= 0 {
 		if atomic.LoadInt32(&ce.deleted) == 0 {
 			tw.onExpired(ce)
 		}
-		return
+		return false
 	}
 
 	// 計算應該放入哪個層級和槽
@@ -389,6 +498,7 @@ func (tw *TimingWheel) addToWheel(ce *cacheEntry) {
 	// 記錄項目所在位置，方便後續移除
 	atomic.StoreInt32(&ce.twLevel, int32(levelIdx))
 	atomic.StoreInt32(&ce.twSlot, int32(targetSlot))
+	return true
 }
 
 // calculateSlot 計算延遲時間對應的層級和槽偏移
@@ -447,8 +557,40 @@ func (tw *TimingWheel) Remove(ce *cacheEntry) {
 		return // 已經被刪除了
 	}
 
-	// 嘗試從槽中移除（可選，減少記憶體佔用）
+	tw.removeFromSlot(ce)
+}
+
+// RemoveMarked 從時間輪中移除已被標記刪除的項目
+//
+// 這個方法假設 ce.deleted 已經被設為 1（由 ExpirationManager.Remove 執行 CAS）
+// 只需要從槽中物理移除並更新計數
+//
+// 參數：
+//   - ce: 已被標記刪除的快取項目
+func (tw *TimingWheel) RemoveMarked(ce *cacheEntry) {
+	tw.removeFromSlot(ce)
+}
+
+// removeFromSlot 從槽中物理移除項目並更新計數
+//
+// 精確計數架構（Section 9.2.4）：
+// - 如果 entry 還在槽位中 → 移除並 totalCount--
+// - 如果 entry 已被 expireSlot 取出（twLevel == -1）→ 不操作 totalCount
+//
+// 這樣設計確保每個 entry 只會被扣減一次：
+// - 被 expireSlot 取出的 → 在取出時批量扣減
+// - 被手動 Forget 的 → 在 Remove 時扣減
+func (tw *TimingWheel) removeFromSlot(ce *cacheEntry) {
 	levelIdx := atomic.LoadInt32(&ce.twLevel)
+
+	// 檢查是否已被 expireSlot 取出（twLevel = -1）
+	if levelIdx == -1 {
+		// 項目已被 expireSlot 取出，totalCount 已在 expireSlot 批量扣過
+		// 不在這裡重複扣減，避免雙重扣減
+		return
+	}
+
+	// 嘗試從槽中移除
 	slotIdx := atomic.LoadInt32(&ce.twSlot)
 
 	if levelIdx >= 0 && levelIdx < int32(levelCount) {
@@ -456,12 +598,17 @@ func (tw *TimingWheel) Remove(ce *cacheEntry) {
 		if slotIdx >= 0 && slotIdx < int32(level.size) {
 			slot := level.slots[slotIdx]
 			slot.mu.Lock()
-			delete(slot.entries, ce)
+			if _, exists := slot.entries[ce]; exists {
+				delete(slot.entries, ce)
+				slot.mu.Unlock()
+				// entry 還在槽位中，需要扣減 totalCount
+				atomic.AddInt64(&tw.totalCount, -1)
+				return
+			}
 			slot.mu.Unlock()
 		}
 	}
-
-	atomic.AddInt64(&tw.totalCount, -1)
+	// 如果項目不在預期的槽中，說明已經被 expireSlot 取出了，totalCount 已扣過
 }
 
 // Count 回傳時間輪中的項目總數
