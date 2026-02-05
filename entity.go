@@ -91,6 +91,12 @@ type (
 		twLevel int32
 		// for TimingWheel use: which slot in the level (use atomic operations)
 		twSlot int32
+		// for TimingWheel use: intrusive doubly linked list pointers
+		twPrev   *cacheEntry
+		twNext   *cacheEntry
+		twBucket atomic.Pointer[twBucket] // 使用 atomic.Pointer 保護並發訪問
+		// for TimingWheel use: epoch version for Flush/Remove race condition prevention
+		twEpoch uint64
 		// expirationSource 標記項目在哪個資料結構中
 		// 0 = 未設定/Forever, 1 = TimingWheel, 2 = ShardedPriorityQueue
 		// (use atomic operations)
