@@ -921,6 +921,290 @@ func BenchmarkTimingWheelMixed(b *testing.B) {
 }
 
 // ============================================================================
+// 11. 修正驗證測試
+// ============================================================================
+
+// TestFix1_PollReturnsExpiration 驗證 Poll 在持鎖狀態下重置 expiration
+// Fix 1: 確保 Offer 不會在 Poll 與 expiration 重置之間覆寫 expiration
+func TestFix1_PollReturnsExpiration(t *testing.T) {
+	stopCh := make(chan struct{})
+	dq := newDelayQueue(stopCh, defaultClock)
+
+	b := newTwBucket()
+	now := defaultClock.Now()
+	targetExp := now + 1 // 1ms 後過期
+
+	dq.Offer(b, targetExp)
+
+	// 等待 bucket 過期
+	done := make(chan struct{})
+	var gotBucket *twBucket
+	var gotExpiration int64
+
+	go func() {
+		gotBucket, gotExpiration = dq.Poll()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		if gotBucket != b {
+			t.Error("Poll 應該返回正確的 bucket")
+		}
+		if gotExpiration != targetExp {
+			t.Errorf("Poll 應返回原始 expiration %d，實際 %d", targetExp, gotExpiration)
+		}
+		// 確認 expiration 已被重置為 -1
+		if exp := atomic.LoadInt64(&b.expiration); exp != -1 {
+			t.Errorf("Poll 後 bucket.expiration 應為 -1，實際 %d", exp)
+		}
+	case <-time.After(5 * time.Second):
+		close(stopCh)
+		t.Fatal("Poll 超時")
+	}
+}
+
+// TestFix2_AddUsesClockNow 驗證 Add 使用 tw.clock.Now() 而非 time.Now()
+// Fix 2: 統一時間來源，MockClock 可正確控制過期判斷
+func TestFix2_AddUsesClockNow(t *testing.T) {
+	// 設定 MockClock 起始時間為 10000ms
+	clock := NewMockClock(10000)
+	tw := newTimingWheelWithClock(time.Second, 64, func(ce *cacheEntry) {}, clock)
+
+	// 建立一個 absoluteExpiration 設定在 MockClock 時間之前的 entry
+	// 如果 Add 使用 time.Now()，它會看到這個 entry 還沒過期（因為 wall clock 遠大於 10000ms）
+	// 如果 Add 正確使用 tw.clock.Now()，它會看到這個 entry 已過期
+	ce := &cacheEntry{
+		key:                "test",
+		value:              "value",
+		absoluteExpiration: 5000 * int64(time.Millisecond), // 5000ms（在 MockClock 的 10000ms 之前）
+		priority:           5000 * int64(time.Millisecond),
+		twLevel:            -1,
+		twSlot:             -1,
+	}
+
+	added := tw.Add(ce)
+	if added {
+		t.Error("absoluteExpiration 在 clock.Now() 之前的 entry 不應被加入")
+	}
+}
+
+// TestFix3_RemoveEmptyBucketFromDelayQueue 驗證移除最後一項後 bucket 從 DelayQueue 移除
+// Fix 3: 避免空 bucket 留在 DelayQueue 造成空喚醒
+func TestFix3_RemoveEmptyBucketFromDelayQueue(t *testing.T) {
+	tw := newTimingWheel(func(ce *cacheEntry) {})
+
+	// 新增一個項目
+	ce := createTestEntry("only-item", 5*time.Second)
+	tw.Add(ce)
+
+	// 確認 DelayQueue 有 bucket
+	if tw.delayQueue.Len() == 0 {
+		t.Fatal("新增項目後 DelayQueue 應該有 bucket")
+	}
+
+	// 移除該項目
+	tw.Remove(ce)
+
+	// 驗證 DelayQueue 的 bucket 已被移除
+	if tw.delayQueue.Len() != 0 {
+		t.Errorf("移除最後一項後 DelayQueue 應為空，實際長度 %d", tw.delayQueue.Len())
+	}
+}
+
+// TestFix4_TotalCountExactlyOnce 驗證 Flush/Remove 競態下 totalCount 不會漏扣
+// Fix 4: 使用 twCountClaimed CAS 確保每個 entry 只扣一次
+func TestFix4_TotalCountExactlyOnce(t *testing.T) {
+	tw := newTimingWheel(func(ce *cacheEntry) {})
+	tw.Start()
+	defer tw.Stop()
+
+	const numItems = 1000
+	entries := make([]*cacheEntry, numItems)
+
+	for i := 0; i < numItems; i++ {
+		entries[i] = createTestEntry(i, 2*time.Second)
+		tw.Add(entries[i])
+	}
+
+	if tw.Count() != numItems {
+		t.Fatalf("新增後預期 %d，實際 %d", numItems, tw.Count())
+	}
+
+	// 並發移除所有項目
+	var wg sync.WaitGroup
+	wg.Add(numItems)
+	for i := 0; i < numItems; i++ {
+		go func(idx int) {
+			defer wg.Done()
+			tw.Remove(entries[idx])
+		}(i)
+	}
+	wg.Wait()
+
+	if count := tw.Count(); count != 0 {
+		t.Errorf("全部移除後 totalCount 應為 0，實際 %d", count)
+	}
+}
+
+// TestFix4_TotalCountFlushRemoveRace 驗證 expireBucket 和 Remove 競態下 totalCount 正確
+func TestFix4_TotalCountFlushRemoveRace(t *testing.T) {
+	var expiredCount int64
+	tw := newTimingWheel(func(ce *cacheEntry) {
+		atomic.AddInt64(&expiredCount, 1)
+	})
+	tw.Start()
+	defer tw.Stop()
+
+	const numRounds = 10
+	for round := 0; round < numRounds; round++ {
+		const numItems = 100
+		entries := make([]*cacheEntry, numItems)
+
+		for i := 0; i < numItems; i++ {
+			entries[i] = createTestEntry(round*numItems+i, 2*time.Second)
+			tw.Add(entries[i])
+		}
+
+		// 移除一半（製造與 expireBucket 的競態）
+		for i := 0; i < numItems; i += 2 {
+			tw.Remove(entries[i])
+		}
+	}
+
+	// 等待所有項目過期或被移除
+	time.Sleep(4 * time.Second)
+
+	count := tw.Count()
+	if count != 0 {
+		t.Errorf("所有項目處理完畢後 totalCount 應為 0，實際 %d", count)
+	}
+}
+
+// TestFix5_MockClockSleepRespectsTarget 驗證 MockClock.Sleep 阻塞到目標時間
+// Fix 5: Sleep 不再被任意 Advance 喚醒
+func TestFix5_MockClockSleepRespectsTarget(t *testing.T) {
+	clock := NewMockClock(0)
+
+	done := make(chan struct{})
+	go func() {
+		clock.Sleep(100 * time.Millisecond) // 目標時間 = 100ms
+		close(done)
+	}()
+
+	// 短暫等待確保 goroutine 進入 Sleep
+	time.Sleep(10 * time.Millisecond)
+
+	// 推進到 50ms — Sleep 不應被喚醒
+	clock.Advance(50 * time.Millisecond)
+
+	select {
+	case <-done:
+		t.Fatal("Sleep(100ms) 不應在 Advance(50ms) 後被喚醒")
+	case <-time.After(50 * time.Millisecond):
+		// OK: 尚未到目標時間
+	}
+
+	// 推進到 100ms — 現在 Sleep 應該被喚醒
+	clock.Advance(50 * time.Millisecond)
+
+	select {
+	case <-done:
+		// OK: 已到達目標時間
+	case <-time.After(1 * time.Second):
+		t.Fatal("Sleep(100ms) 應在 current >= 100ms 時被喚醒")
+	}
+}
+
+// TestFix5_MockClockSleepMultipleWaiters 驗證多個 Sleep 依各自目標時間喚醒
+func TestFix5_MockClockSleepMultipleWaiters(t *testing.T) {
+	clock := NewMockClock(0)
+
+	var order []int
+	var mu sync.Mutex
+
+	record := func(id int) {
+		mu.Lock()
+		order = append(order, id)
+		mu.Unlock()
+	}
+
+	// 啟動三個 Sleep，目標時間不同
+	go func() {
+		clock.Sleep(300 * time.Millisecond)
+		record(3)
+	}()
+	go func() {
+		clock.Sleep(100 * time.Millisecond)
+		record(1)
+	}()
+	go func() {
+		clock.Sleep(200 * time.Millisecond)
+		record(2)
+	}()
+
+	// 等待 goroutine 進入 Sleep
+	time.Sleep(20 * time.Millisecond)
+
+	// 逐步推進時間
+	clock.Advance(100 * time.Millisecond) // → 100ms：waiter 1 醒
+	time.Sleep(10 * time.Millisecond)
+
+	clock.Advance(100 * time.Millisecond) // → 200ms：waiter 2 醒
+	time.Sleep(10 * time.Millisecond)
+
+	clock.Advance(100 * time.Millisecond) // → 300ms：waiter 3 醒
+	time.Sleep(10 * time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if len(order) != 3 {
+		t.Fatalf("預期 3 個 waiter 被喚醒，實際 %d", len(order))
+	}
+
+	for i, id := range order {
+		if id != i+1 {
+			t.Errorf("第 %d 個喚醒的應為 waiter %d，實際為 %d", i, i+1, id)
+		}
+	}
+}
+
+// TestFix3_RemoveBucketHeapAt 驗證 bucketHeap.RemoveAt 堆性質維護
+func TestFix3_RemoveBucketHeapAt(t *testing.T) {
+	stopCh := make(chan struct{})
+	dq := newDelayQueue(stopCh, defaultClock)
+
+	now := defaultClock.Now()
+
+	// 加入多個 bucket
+	buckets := make([]*twBucket, 5)
+	for i := 0; i < 5; i++ {
+		buckets[i] = newTwBucket()
+		dq.Offer(buckets[i], now+int64(i+1)*100)
+	}
+
+	if dq.Len() != 5 {
+		t.Fatalf("預期 5 個 bucket，實際 %d", dq.Len())
+	}
+
+	// 移除中間的 bucket
+	dq.RemoveBucket(buckets[2])
+
+	if dq.Len() != 4 {
+		t.Errorf("移除後預期 4 個 bucket，實際 %d", dq.Len())
+	}
+
+	// 確認被移除的 bucket 狀態
+	if buckets[2].heapIndex != -1 {
+		t.Errorf("被移除的 bucket heapIndex 應為 -1，實際 %d", buckets[2].heapIndex)
+	}
+	if exp := atomic.LoadInt64(&buckets[2].expiration); exp != -1 {
+		t.Errorf("被移除的 bucket expiration 應為 -1，實際 %d", exp)
+	}
+}
+
+// ============================================================================
 // 與 ShardedPriorityQueue 比較測試
 // ============================================================================
 

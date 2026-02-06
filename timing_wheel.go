@@ -135,12 +135,18 @@ func (t *realTimer) Reset(d time.Duration) bool {
 // MockClock - 用於測試的模擬時鐘
 // ============================================================================
 
+// mockWaiter 代表一個等待 Sleep 完成的 goroutine
+type mockWaiter struct {
+	targetTime int64
+	ch         chan struct{}
+}
+
 // MockClock 是可手動控制的模擬時鐘
 type MockClock struct {
 	mu      sync.Mutex
-	current int64           // 當前時間（毫秒）
-	timers  []*mockTimer    // 所有計時器
-	waiters []chan struct{} // 等待 Advance 的 goroutine
+	current int64        // 當前時間（毫秒）
+	timers  []*mockTimer // 所有計時器
+	waiters []mockWaiter // 等待 Advance 的 goroutine（帶目標時間）
 }
 
 // NewMockClock 建立模擬時鐘
@@ -158,7 +164,7 @@ func (c *MockClock) Now() int64 {
 	return c.current
 }
 
-// Sleep 模擬睡眠（立即返回，但會被 Advance 喚醒）
+// Sleep 模擬睡眠，阻塞直到 Advance 推進時間到 >= targetTime
 func (c *MockClock) Sleep(d time.Duration) {
 	if d <= 0 {
 		return
@@ -166,12 +172,21 @@ func (c *MockClock) Sleep(d time.Duration) {
 
 	c.mu.Lock()
 	targetTime := c.current + int64(d/time.Millisecond)
-	waiter := make(chan struct{})
-	c.waiters = append(c.waiters, waiter)
+
+	// 若已到達目標時間，直接返回
+	if c.current >= targetTime {
+		c.mu.Unlock()
+		return
+	}
+
+	w := mockWaiter{
+		targetTime: targetTime,
+		ch:         make(chan struct{}),
+	}
+	c.waiters = append(c.waiters, w)
 	c.mu.Unlock()
 
-	<-waiter
-	_ = targetTime // 實際上由 Advance 控制
+	<-w.ch
 }
 
 // NewTimer 建立模擬計時器
@@ -188,7 +203,7 @@ func (c *MockClock) NewTimer(d time.Duration) Timer {
 	return t
 }
 
-// Advance 推進模擬時間
+// Advance 推進模擬時間，只喚醒已達到目標時間的 waiter
 func (c *MockClock) Advance(d time.Duration) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -206,11 +221,16 @@ func (c *MockClock) Advance(d time.Duration) {
 		}
 	}
 
-	// 喚醒所有等待者
+	// 只喚醒已達到目標時間的等待者
+	remaining := c.waiters[:0]
 	for _, w := range c.waiters {
-		close(w)
+		if c.current >= w.targetTime {
+			close(w.ch)
+		} else {
+			remaining = append(remaining, w)
+		}
 	}
-	c.waiters = c.waiters[:0]
+	c.waiters = remaining
 }
 
 // Set 直接設定時間
@@ -374,6 +394,39 @@ func (h *bucketHeap) Fix(i int) {
 	}
 }
 
+// RemoveAt 移除指定索引的 bucket 並維護堆性質。
+// 時間複雜度：O(log4 n)
+func (h *bucketHeap) RemoveAt(i int) *twBucket {
+	n := len(h.items)
+	if i < 0 || i >= n {
+		return nil
+	}
+
+	b := h.items[i]
+	b.heapIndex = -1
+
+	last := n - 1
+	if i == last {
+		// 移除的是最後一個元素，直接截斷
+		h.items[last] = nil
+		h.items = h.items[:last]
+		return b
+	}
+
+	// 將最後一個元素移到被移除的位置
+	h.items[i] = h.items[last]
+	h.items[i].heapIndex = i
+	h.items[last] = nil
+	h.items = h.items[:last]
+
+	// 重新平衡
+	if !h.siftUp(i) {
+		h.siftDown(i)
+	}
+
+	return b
+}
+
 // Peek 返回堆頂 bucket 但不移除。
 // 若堆為空則返回 nil。
 func (h *bucketHeap) Peek() *twBucket {
@@ -520,8 +573,10 @@ func (dq *delayQueue) signalWakeup() {
 }
 
 // Poll 阻塞等待直到有 Bucket 過期或收到停止信號
-// 返回過期的 Bucket；若收到停止信號則返回 nil
-func (dq *delayQueue) Poll() *twBucket {
+// 返回過期的 Bucket 及其原始過期時間；若收到停止信號則返回 (nil, 0)
+// 注意：Pop 時會在持有 dq.mu 的情況下將 bucket.expiration 設為 -1，
+// 避免 Offer() 在 Pop 與 expiration 重置之間的窗口內覆寫 expiration。
+func (dq *delayQueue) Poll() (*twBucket, int64) {
 	for {
 		dq.mu.Lock()
 
@@ -529,7 +584,7 @@ func (dq *delayQueue) Poll() *twBucket {
 		select {
 		case <-dq.stopCh:
 			dq.mu.Unlock()
-			return nil
+			return nil, 0
 		default:
 		}
 
@@ -540,7 +595,7 @@ func (dq *delayQueue) Poll() *twBucket {
 			case <-dq.wakeupCh:
 				continue
 			case <-dq.stopCh:
-				return nil
+				return nil, 0
 			}
 		}
 
@@ -552,10 +607,11 @@ func (dq *delayQueue) Poll() *twBucket {
 		delay := expiration - now
 
 		if delay <= 0 {
-			// 已過期，彈出返回
+			// 已過期，彈出並在持鎖狀態下標記 bucket 不在佇列中
 			dq.pq.Pop()
+			atomic.StoreInt64(&b.expiration, -1)
 			dq.mu.Unlock()
-			return b
+			return b, expiration
 		}
 
 		// 尚未過期，精確睡眠
@@ -572,9 +628,34 @@ func (dq *delayQueue) Poll() *twBucket {
 			dq.timer.Stop()
 		case <-dq.stopCh:
 			dq.timer.Stop()
-			return nil
+			return nil, 0
 		}
 	}
+}
+
+// RemoveBucket 從佇列中移除指定的空 bucket（若存在）。
+// 用於 Remove() 清空 bucket 後避免空喚醒。
+// 安全性：持有 dq.mu 後再檢查 bucket.count，確保不會移除剛被重新使用的 bucket。
+// 鎖序為 dq.mu → b.mu，不會與其他路徑（b.mu → release → dq.mu）產生死鎖。
+func (dq *delayQueue) RemoveBucket(b *twBucket) {
+	dq.mu.Lock()
+	defer dq.mu.Unlock()
+
+	if b.heapIndex < 0 {
+		return // 不在佇列中
+	}
+
+	// 持有 bucket 鎖確認 count 仍為 0
+	b.mu.Lock()
+	empty := b.count == 0
+	b.mu.Unlock()
+
+	if !empty {
+		return // 已有新項目加入，不移除
+	}
+
+	dq.pq.RemoveAt(b.heapIndex)
+	atomic.StoreInt64(&b.expiration, -1)
 }
 
 // Len 返回佇列長度
@@ -826,15 +907,11 @@ func (tw *TimingWheel) run() {
 	defer tw.wg.Done()
 
 	for {
-		// Poll 內部監聽 stopCh
-		bucket := tw.delayQueue.Poll()
+		// Poll 內部監聽 stopCh，並在持鎖狀態下重置 expiration
+		bucket, expiration := tw.delayQueue.Poll()
 		if bucket == nil {
 			return // 收到停止信號
 		}
-
-		// 先保存過期時間，然後標記 bucket 不在佇列中
-		expiration := atomic.LoadInt64(&bucket.expiration)
-		atomic.StoreInt64(&bucket.expiration, -1)
 
 		// 推進時鐘
 		tw.advanceClock(expiration)
@@ -881,11 +958,10 @@ func (tw *TimingWheel) expireBucket(bucket *twBucket) {
 		// P1 修復：不預先設置 ce.deleted，讓 handleExpired → removeEntry → em.Remove
 		// 來競爭刪除權，確保 CAS 機制正確運作
 		if atomic.LoadInt32(&ce.deleted) == 1 {
+			// Remove() 已通過 twCountClaimed CAS 處理了 totalCount
 			ce = next
 			continue
 		}
-
-		atomic.AddInt64(&tw.totalCount, -1)
 
 		// 檢查是否需要降級（cascade）或真正過期
 		expiration := ce.getPriority() / int64(time.Millisecond)
@@ -893,15 +969,19 @@ func (tw *TimingWheel) expireBucket(bucket *twBucket) {
 
 		if expiration > currentTime+tw.tick {
 			// 還沒過期，需要重新加入（降級場景）
-			if tw.addInternal(ce) {
-				// 成功重新加入，恢復計數
-				atomic.AddInt64(&tw.totalCount, 1)
-			} else {
-				// 加入失敗（項目在過程中已過期），執行回調
+			// 不扣 totalCount，因為項目仍在時間輪中
+			if !tw.addInternal(ce) {
+				// 加入失敗（項目在過程中已過期），CAS 扣減計數
+				if atomic.CompareAndSwapInt32(&ce.twCountClaimed, 0, 1) {
+					atomic.AddInt64(&tw.totalCount, -1)
+				}
 				tw.safeOnExpired(ce)
 			}
 		} else {
-			// 真正過期，執行回調
+			// 真正過期，CAS 確保 totalCount 只扣一次
+			if atomic.CompareAndSwapInt32(&ce.twCountClaimed, 0, 1) {
+				atomic.AddInt64(&tw.totalCount, -1)
+			}
 			tw.safeOnExpired(ce)
 		}
 
@@ -936,13 +1016,15 @@ func (tw *TimingWheel) Add(ce *cacheEntry) bool {
 		return false
 	}
 
-	// P2 修復：先使用納秒級精度檢查是否已過期
-	// 這比 addInternal 的毫秒級檢查更精確，能正確處理 TTL=0 的情況
+	// P2 修復：先檢查是否已過期，能正確處理 TTL=0 的情況
 	// 注意：absoluteExpiration < 0 表示永不過期，應該跳過此檢查
+	// 統一使用 tw.clock.Now()（毫秒），確保與時間輪其他部分使用相同時間基準，
+	// 也讓 MockClock 測試能正確運作
 	absExp := ce.getAbsoluteExpiration()
 	if absExp >= 0 {
-		nowNano := time.Now().UnixNano()
-		if absExp <= nowNano {
+		absExpMs := absExp / int64(time.Millisecond)
+		nowMs := tw.clock.Now()
+		if absExpMs <= nowMs {
 			// 已過期，立即觸發過期回調
 			tw.safeOnExpired(ce)
 			return false
@@ -954,6 +1036,7 @@ func (tw *TimingWheel) Add(ce *cacheEntry) bool {
 	ce.twNext = nil
 	ce.twBucket.Store(nil)
 	atomic.StoreInt32(&ce.twLevel, int32(tw.level))
+	atomic.StoreInt32(&ce.twCountClaimed, 0)
 
 	if tw.addInternal(ce) {
 		atomic.AddInt64(&tw.totalCount, 1)
@@ -1067,18 +1150,35 @@ func (tw *TimingWheel) Remove(ce *cacheEntry) bool {
 		return false
 	}
 
+	// CAS twCountClaimed 確保 totalCount 只扣一次
+	// 即使 Flush/expireBucket 競態導致 bucket.Remove 失敗，也能正確扣減
+	if atomic.CompareAndSwapInt32(&ce.twCountClaimed, 0, 1) {
+		atomic.AddInt64(&tw.totalCount, -1)
+	}
+
 	bucket := ce.twBucket.Load()
 	if bucket != nil && bucket.Remove(ce) {
-		atomic.AddInt64(&tw.totalCount, -1)
+		// 若 bucket 已清空，嘗試從 DelayQueue 移除以避免空喚醒
+		if atomic.LoadInt64(&bucket.count) == 0 {
+			tw.delayQueue.RemoveBucket(bucket)
+		}
 	}
 	return true
 }
 
 // RemoveMarked 移除已標記刪除的項目（由 ExpirationManager 呼叫）
 func (tw *TimingWheel) RemoveMarked(ce *cacheEntry) {
+	// CAS twCountClaimed 確保 totalCount 只扣一次
+	if atomic.CompareAndSwapInt32(&ce.twCountClaimed, 0, 1) {
+		atomic.AddInt64(&tw.totalCount, -1)
+	}
+
 	bucket := ce.twBucket.Load()
 	if bucket != nil && bucket.Remove(ce) {
-		atomic.AddInt64(&tw.totalCount, -1)
+		// 若 bucket 已清空，嘗試從 DelayQueue 移除以避免空喚醒
+		if atomic.LoadInt64(&bucket.count) == 0 {
+			tw.delayQueue.RemoveBucket(bucket)
+		}
 	}
 }
 
