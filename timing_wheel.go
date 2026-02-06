@@ -972,16 +972,12 @@ func (tw *TimingWheel) expireBucket(bucket *twBucket) {
 			// 不扣 totalCount，因為項目仍在時間輪中
 			if !tw.addInternal(ce) {
 				// 加入失敗（項目在過程中已過期），CAS 扣減計數
-				if atomic.CompareAndSwapInt32(&ce.twCountClaimed, 0, 1) {
-					atomic.AddInt64(&tw.totalCount, -1)
-				}
+				tw.claimCount(ce)
 				tw.safeOnExpired(ce)
 			}
 		} else {
 			// 真正過期，CAS 確保 totalCount 只扣一次
-			if atomic.CompareAndSwapInt32(&ce.twCountClaimed, 0, 1) {
-				atomic.AddInt64(&tw.totalCount, -1)
-			}
+			tw.claimCount(ce)
 			tw.safeOnExpired(ce)
 		}
 
@@ -1025,7 +1021,8 @@ func (tw *TimingWheel) Add(ce *cacheEntry) bool {
 		absExpMs := absExp / int64(time.Millisecond)
 		nowMs := tw.clock.Now()
 		if absExpMs <= nowMs {
-			// 已過期，立即觸發過期回調
+			// 已過期，未入隊，預先標記防止 claimCount 誤扣 totalCount
+			atomic.StoreInt32(&ce.twCountClaimed, 1)
 			tw.safeOnExpired(ce)
 			return false
 		}
@@ -1044,7 +1041,8 @@ func (tw *TimingWheel) Add(ce *cacheEntry) bool {
 	}
 
 	// P2 修復：addInternal 返回 false 表示項目已過期
-	// 立即觸發過期回調，而不是靜默丟棄
+	// 未入隊，預先標記防止 claimCount 誤扣 totalCount
+	atomic.StoreInt32(&ce.twCountClaimed, 1)
 	tw.safeOnExpired(ce)
 	return false
 }
@@ -1143,6 +1141,26 @@ func (tw *TimingWheel) getOrCreateOverflowWheel() *TimingWheel {
 	return overflow
 }
 
+// claimCount CAS 扣減 totalCount，確保每個 entry 只扣一次。
+func (tw *TimingWheel) claimCount(ce *cacheEntry) {
+	if atomic.CompareAndSwapInt32(&ce.twCountClaimed, 0, 1) {
+		atomic.AddInt64(&tw.totalCount, -1)
+	}
+}
+
+// claimAndDetach 扣減 totalCount 並從 bucket 中移除項目。
+func (tw *TimingWheel) claimAndDetach(ce *cacheEntry) {
+	tw.claimCount(ce)
+
+	bucket := ce.twBucket.Load()
+	if bucket != nil && bucket.Remove(ce) {
+		// 若 bucket 已清空，嘗試從 DelayQueue 移除以避免空喚醒
+		if atomic.LoadInt64(&bucket.count) == 0 {
+			tw.delayQueue.RemoveBucket(bucket)
+		}
+	}
+}
+
 // Remove 從時間輪移除項目
 func (tw *TimingWheel) Remove(ce *cacheEntry) bool {
 	// CAS 標記刪除
@@ -1150,36 +1168,13 @@ func (tw *TimingWheel) Remove(ce *cacheEntry) bool {
 		return false
 	}
 
-	// CAS twCountClaimed 確保 totalCount 只扣一次
-	// 即使 Flush/expireBucket 競態導致 bucket.Remove 失敗，也能正確扣減
-	if atomic.CompareAndSwapInt32(&ce.twCountClaimed, 0, 1) {
-		atomic.AddInt64(&tw.totalCount, -1)
-	}
-
-	bucket := ce.twBucket.Load()
-	if bucket != nil && bucket.Remove(ce) {
-		// 若 bucket 已清空，嘗試從 DelayQueue 移除以避免空喚醒
-		if atomic.LoadInt64(&bucket.count) == 0 {
-			tw.delayQueue.RemoveBucket(bucket)
-		}
-	}
+	tw.claimAndDetach(ce)
 	return true
 }
 
 // RemoveMarked 移除已標記刪除的項目（由 ExpirationManager 呼叫）
 func (tw *TimingWheel) RemoveMarked(ce *cacheEntry) {
-	// CAS twCountClaimed 確保 totalCount 只扣一次
-	if atomic.CompareAndSwapInt32(&ce.twCountClaimed, 0, 1) {
-		atomic.AddInt64(&tw.totalCount, -1)
-	}
-
-	bucket := ce.twBucket.Load()
-	if bucket != nil && bucket.Remove(ce) {
-		// 若 bucket 已清空，嘗試從 DelayQueue 移除以避免空喚醒
-		if atomic.LoadInt64(&bucket.count) == 0 {
-			tw.delayQueue.RemoveBucket(bucket)
-		}
-	}
+	tw.claimAndDetach(ce)
 }
 
 // Count 返回項目總數
@@ -1221,11 +1216,6 @@ func nextPowerOfTwo(n int64) int64 {
 	n |= n >> 16
 	n |= n >> 32
 	return n + 1
-}
-
-// timeToMs 將 time.Time 轉換為毫秒（保留給外部使用）
-func timeToMs(t time.Time) int64 {
-	return t.UnixNano() / int64(time.Millisecond)
 }
 
 // ============================================================================

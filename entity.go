@@ -69,17 +69,15 @@ type (
 		created int64
 		// lives at this point in time. (unix nanoseconds, use atomic operations)
 		absoluteExpiration int64
-		// for PriorityQueue use (use atomic operations)
+		// for expiration ordering (use atomic operations)
 		priority int64
 		// for sliding scan use (use atomic operations)
 		lastAccessed int64
 		// how long a cache entry can be inactive (e.g. not accessed). **only positive**
 		slidingExpiration time.Duration
-		// for PriorityQueue use
-		index int
 		// is it expired (use atomic operations: 0 = false, 1 = true)
 		expired int32
-		// for lazy deletion in priority queue (use atomic operations: 0 = active, 1 = deleted)
+		// for deletion (use atomic operations: 0 = active, 1 = deleted)
 		deleted int32
 		// post eviction callback
 		evictionCallback PostEvictionCallback
@@ -89,8 +87,6 @@ type (
 		cancelFunc context.CancelFunc
 		// for TimingWheel use: which level the entry is in (use atomic operations)
 		twLevel int32
-		// for TimingWheel use: which slot in the level (use atomic operations)
-		twSlot int32
 		// for TimingWheel use: intrusive doubly linked list pointers
 		twPrev   *cacheEntry
 		twNext   *cacheEntry
@@ -100,15 +96,6 @@ type (
 		// for TimingWheel use: ensures totalCount is decremented exactly once per entry
 		// CAS from 0→1 to claim the right to decrement (use atomic operations)
 		twCountClaimed int32
-		// expirationSource 標記項目在哪個資料結構中
-		// 0 = 未設定/Forever, 1 = TimingWheel, 2 = ShardedPriorityQueue
-		// (use atomic operations)
-		expirationSource int32
-		// spqDirtyMarked 標記是否已經在 SPQ 中增加了 dirtyCount
-		// 用於防止並發窗口導致 dirtyCount 被重複增加
-		// 0 = 未標記, 1 = 已標記
-		// (use atomic operations with CAS)
-		spqDirtyMarked int32
 	}
 
 	// EntryOptions represents options for creating a cache entry.

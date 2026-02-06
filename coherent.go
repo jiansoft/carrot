@@ -14,7 +14,7 @@ import (
 type (
 	// CacheCoherent is a thread-safe in-memory cache that supports multiple expiration policies.
 	CacheCoherent struct {
-		// em 過期管理器（替換原本的 spq）
+		// em 過期管理器
 		em *ExpirationManager
 		// save cache entry.
 		usage sync.Map
@@ -25,21 +25,13 @@ type (
 		// maximum size limit (0 means no limit).
 		sizeLimit int64
 		stats     CacheStatistics
-		// currently in the state of scanning for expired.
-		onScanForExpired atomic.Bool
-		// the minimum length of time between successive scans for expired items.
-		expirationScanFrequency int64
-		// last expired scanning time(UnixNano)
-		lastExpirationScan int64
 	}
 )
 
 // NewCacheCoherent creates a new CacheCoherent instance.
 func newCacheCoherent() *CacheCoherent {
 	coherent := &CacheCoherent{
-		stats:                   CacheStatistics{},
-		lastExpirationScan:      time.Now().UTC().UnixNano(),
-		expirationScanFrequency: int64(time.Minute),
+		stats: CacheStatistics{},
 	}
 
 	// 建立過期管理器，設定過期回調
@@ -49,18 +41,6 @@ func newCacheCoherent() *CacheCoherent {
 	coherent.em.Start()
 
 	return coherent
-}
-
-// SetScanFrequency sets a new frequency value for scanning expired items.
-// Returns false if the frequency is not positive.
-func (cc *CacheCoherent) SetScanFrequency(frequency time.Duration) bool {
-	if frequency <= 0 {
-		return false
-	}
-
-	atomic.StoreInt64(&cc.expirationScanFrequency, int64(frequency))
-
-	return true
 }
 
 // SetSizeLimit sets the maximum size limit for the cache.
@@ -158,11 +138,6 @@ func (cc *CacheCoherent) GetOrCreate(key, val any, ttl time.Duration) (any, bool
 			newExp := nowUtc + ce.slidingExpiration.Nanoseconds()
 			ce.setAbsoluteExpiration(newExp)
 			ce.setPriority(newExp)
-			// 只有 ShardedPQueue 需要 update
-			source := atomic.LoadInt32(&ce.expirationSource)
-			if source == expirationSourcePriorityQueue {
-				cc.em.Update(ce)
-			}
 		}
 		return ce.value, true
 	}
@@ -277,21 +252,6 @@ func (cc *CacheCoherent) Compact(percentage float64) {
 	}
 }
 
-// ShrinkExpirationQueue 對內部過期管理的優先佇列進行碎片整理
-//
-// 當大量項目過期或被刪除後，ShardedPriorityQueue 底層可能存在記憶體碎片。
-// 此方法會重建碎片率超過 50% 的 shard，釋放未使用的空間。
-//
-// 注意：此操作不影響任何快取項目，只是內部記憶體優化。
-// 與 Compact(percentage) 不同，後者會主動驅逐快取項目。
-//
-// 使用場景：
-//   - 定期維護（如每小時執行一次）
-//   - 在記憶體壓力時主動呼叫
-func (cc *CacheCoherent) ShrinkExpirationQueue() {
-	cc.em.Shrink()
-}
-
 // Keep inserts an item into the memory cache.
 func (cc *CacheCoherent) keep(key any, val any, option entryOptions) {
 	var (
@@ -354,9 +314,6 @@ func (cc *CacheCoherent) keep(key any, val any, option entryOptions) {
 
 	if expired {
 		// newEntry 已過期，不放入快取
-		// 注意：此時 priorEntry 已被移除，但 key 可能在並發下被其他 goroutine 設定了新值
-		// 由於我們不打算存入 newEntry，也不應該刪除其他 goroutine 存入的值
-		// 因此這裡「不做任何 Delete 操作」，讓其他可能存入的值保持不變
 		return
 	}
 
@@ -369,7 +326,6 @@ func (cc *CacheCoherent) keep(key any, val any, option entryOptions) {
 	atomic.AddInt64(&cc.usageCount, 1)
 
 	cc.enforceSizeLimit()
-	cc.scanForExpiredItemsIfNeeded(nowUtc)
 }
 
 // EnforceSizeLimit removes items if the size limit is exceeded.
@@ -443,7 +399,7 @@ func (cc *CacheCoherent) compactBySize(targetSize int64) {
 //
 // 回傳：true 表示成功移除，false 表示已被其他 goroutine 處理
 func (cc *CacheCoherent) removeEntry(key any, ce *cacheEntry, reason int32) bool {
-	// 1. 透過 ExpirationManager 競爭刪除權並從過期佇列移除
+	// 1. 透過 ExpirationManager 競爭刪除權並從 TimingWheel 移除
 	// em.Remove 內部會執行 CAS atomic.CompareAndSwapInt32(&ce.deleted, 0, 1)
 	if !cc.em.Remove(ce) {
 		return false // 已被其他 goroutine 處理
@@ -483,13 +439,11 @@ func (cc *CacheCoherent) handleExpired(ce *cacheEntry) {
 //
 // 效能特性：
 //   - 主要讀取來自 sync.Map，O(1)
-//   - Sliding 項目在 TimingWheel 中：O(1)（Lazy 檢查，不需移動項目）
-//   - Sliding 項目在 ShardedPQueue 中：O(log n)（需要 heap.Fix）
+//   - Sliding 項目：O(1)（TimingWheel Lazy 檢查，不需移動項目）
 //
 // 並發安全性：
 //   - setLastAccessed 使用 atomic.StoreInt64，確保與 expireSlot 的讀取不會競態
-//   - TimingWheel 的 Lazy 檢查只依賴 lastAccessed + slidingExpiration（不依賴 priority）
-//   - ShardedPQueue 的 update 在自己的 shard lock 保護下執行
+//   - TimingWheel 的 Lazy 檢查只依賴 lastAccessed + slidingExpiration
 func (cc *CacheCoherent) Read(key any) (any, bool) {
 	nowUtc := time.Now().UTC().UnixNano()
 	ce, exist := cc.loadCacheEntryFromUsage(key)
@@ -504,29 +458,16 @@ func (cc *CacheCoherent) Read(key any) (any, bool) {
 		// Sliding 項目：更新過期時間
 		if ce.isSliding() {
 			newExp := nowUtc + ce.slidingExpiration.Nanoseconds()
-
-			// 這兩個更新主要用於 ShardedPQueue
-			// TimingWheel 不依賴這些值（使用 lastAccessed + slidingExpiration 計算）
 			ce.setAbsoluteExpiration(newExp)
 			ce.setPriority(newExp)
-
-			// 只有 ShardedPQueue 需要 update（heap.Fix）
 			// TimingWheel 採用 Lazy 檢查，在槽處理時才會重新排程
-			// 這樣可以保持 Read 操作的 O(1) 效能
-			source := atomic.LoadInt32(&ce.expirationSource)
-			if source == expirationSourcePriorityQueue {
-				cc.em.Update(ce)
-			}
-			// TimingWheel: 不需要任何操作
-			// expireSlot 時會檢查 lastAccessed + slidingExpiration
+			// 不需要任何額外操作，保持 Read 的 O(1) 效能
 		}
 
-		cc.scanForExpiredItemsIfNeeded(nowUtc)
 		return ce.value, true
 	}
 
 	atomic.AddInt64(&cc.stats.totalMisses, 1)
-	cc.scanForExpiredItemsIfNeeded(nowUtc)
 
 	return nil, false
 }
@@ -546,8 +487,6 @@ func (cc *CacheCoherent) forget(key any, _ int64) {
 	if ce, exist := cc.loadCacheEntryFromUsage(key); exist {
 		cc.removeEntry(key, ce, int32(EvictionReasonRemoved))
 	}
-	// Skip scanForExpiredItemsIfNeeded on forget to improve performance
-	// Expired items will be cleaned up on subsequent operations
 }
 
 // Reset removes all items from the memory and resets statistics.
@@ -574,7 +513,7 @@ func (cc *CacheCoherent) Reset() {
 	cc.em.Clear()
 	atomic.StoreInt64(&cc.usageCount, 0)
 	atomic.StoreInt64(&cc.currentSize, 0)
-	// 注意：不重置 totalHits/totalMisses（設計文件 Section 5.3.6）
+	// 注意：不重置 totalHits/totalMisses
 	// 統計資訊是累計的，Reset 只清空快取內容
 }
 
@@ -587,65 +526,16 @@ func (cc *CacheCoherent) loadCacheEntryFromUsage(key any) (*cacheEntry, bool) {
 	return nil, false
 }
 
-func (cc *CacheCoherent) scanForExpiredItemsIfNeeded(nowUtc int64) {
-	// Quick check without CAS to avoid contention
-	lastScan := atomic.LoadInt64(&cc.lastExpirationScan)
-	freq := atomic.LoadInt64(&cc.expirationScanFrequency)
-	if freq > nowUtc-lastScan {
-		return
-	}
-
-	// Use CAS to ensure only one goroutine triggers the scan
-	if cc.onScanForExpired.Swap(true) {
-		return
-	}
-
-	robin.RightNow().Do(cc.flushExpired, nowUtc)
-}
-
-// FlushExpired removes expired items from the memory.
-//
-// 僅處理 SPQ 中的項目，TW 會主動回調 handleExpired
-func (cc *CacheCoherent) flushExpired(nowUtc int64) {
-	defer func() {
-		atomic.StoreInt64(&cc.lastExpirationScan, nowUtc)
-		cc.onScanForExpired.Store(false)
-	}()
-
-	// 僅處理 ShardedPQueue 中的項目
-	// TimingWheel 是主動清理，會透過 handleExpired 回調處理
-	loop := cc.em.PriorityQueueCount()
-	for i := 0; i < loop; i++ {
-		ce, yes := cc.em.Dequeue(nowUtc)
-		if !yes {
-			break
-		}
-		// 透過統一邏輯處理，確保 CAS 機制正確
-		cc.removeEntry(ce.key, ce, int32(EvictionReasonExpired))
-	}
-}
-
 // Statistics returns a snapshot of cache statistics.
 func (cc *CacheCoherent) Statistics() CacheStatistics {
 	statistics := CacheStatistics{
 		usageCount:  int(atomic.LoadInt64(&cc.usageCount)),
-		pqCount:     cc.em.PriorityQueueCount(),
 		twCount:     cc.em.TimingWheelCount(),
 		totalMisses: atomic.LoadInt64(&cc.stats.totalMisses),
 		totalHits:   atomic.LoadInt64(&cc.stats.totalHits),
 	}
 
 	return statistics
-}
-
-// SetExpirationStrategy 設定過期策略
-func (cc *CacheCoherent) SetExpirationStrategy(s ExpirationStrategy) {
-	cc.em.SetStrategy(s)
-}
-
-// SetShortTTLThreshold 設定短 TTL 閾值
-func (cc *CacheCoherent) SetShortTTLThreshold(d time.Duration) {
-	cc.em.SetThreshold(d)
 }
 
 // ExpirationStats 取得過期統計資訊

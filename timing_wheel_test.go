@@ -39,7 +39,6 @@ func createTestEntry(key any, ttl time.Duration) *cacheEntry {
 		absoluteExpiration: expireAt,
 		created:            now,
 		twLevel:            -1,
-		twSlot:             -1,
 	}
 }
 
@@ -536,7 +535,6 @@ func TestTimingWheelForeverEntry(t *testing.T) {
 		absoluteExpiration: -1,                     // 永不過期的標記
 		created:            time.Now().UnixNano(),
 		twLevel:            -1,
-		twSlot:             -1,
 	}
 
 	// 嘗試加入時間輪
@@ -980,7 +978,6 @@ func TestFix2_AddUsesClockNow(t *testing.T) {
 		absoluteExpiration: 5000 * int64(time.Millisecond), // 5000ms（在 MockClock 的 10000ms 之前）
 		priority:           5000 * int64(time.Millisecond),
 		twLevel:            -1,
-		twSlot:             -1,
 	}
 
 	added := tw.Add(ce)
@@ -1596,55 +1593,4 @@ func TestSafeOnExpired_PanicRecovery(t *testing.T) {
 	if !tw.IsRunning() {
 		t.Error("onExpired panic 不應導致時間輪停止")
 	}
-}
-
-// ============================================================================
-// 與 ShardedPriorityQueue 比較測試
-// ============================================================================
-
-// BenchmarkTimingWheelVsShardedPQueue 比較時間輪和分片優先佇列
-func BenchmarkTimingWheelVsShardedPQueue(b *testing.B) {
-	b.Run("TimingWheel-Add", func(b *testing.B) {
-		tw := newTimingWheel(func(ce *cacheEntry) {})
-		b.ResetTimer()
-		for i := 0; i < b.N; i++ {
-			ce := createTestEntry(i, 10*time.Second)
-			tw.Add(ce)
-		}
-	})
-
-	b.Run("ShardedPQueue-Enqueue", func(b *testing.B) {
-		spq := newShardedPriorityQueue()
-		b.ResetTimer()
-		for i := 0; i < b.N; i++ {
-			ce := createTestEntry(i, 10*time.Second)
-			spq.enqueue(ce)
-		}
-	})
-
-	b.Run("TimingWheel-Remove", func(b *testing.B) {
-		tw := newTimingWheel(func(ce *cacheEntry) {})
-		entries := make([]*cacheEntry, b.N)
-		for i := 0; i < b.N; i++ {
-			entries[i] = createTestEntry(i, time.Hour)
-			tw.Add(entries[i])
-		}
-		b.ResetTimer()
-		for i := 0; i < b.N; i++ {
-			tw.Remove(entries[i])
-		}
-	})
-
-	b.Run("ShardedPQueue-Remove", func(b *testing.B) {
-		spq := newShardedPriorityQueue()
-		entries := make([]*cacheEntry, b.N)
-		for i := 0; i < b.N; i++ {
-			entries[i] = createTestEntry(i, time.Hour)
-			spq.enqueue(entries[i])
-		}
-		b.ResetTimer()
-		for i := 0; i < b.N; i++ {
-			spq.remove(entries[i])
-		}
-	})
 }

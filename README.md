@@ -13,7 +13,7 @@ A high-performance, thread-safe in-memory cache library for Go, with 100%+ featu
 
 - **Multiple expiration policies** - Absolute time, sliding expiration, or never expire
 - **Thread-safe** - Uses `sync.Map` and `sync.Mutex` for concurrent access
-- **Hybrid expiration management** - TimingWheel for short TTL (batch expiration) + ShardedPriorityQueue for long TTL (efficient single-item operations)
+- **Event-driven expiration** - Hierarchical TimingWheel with O(1) batch expiration for all TTL ranges
 - **Cache statistics** - Track hit/miss rates and usage counts
 - **Singleton & custom instances** - Use the default global instance or create your own
 - **GetOrCreate pattern** - Atomic get-or-create operations (similar to .NET's GetOrCreate)
@@ -105,15 +105,11 @@ func main() {
 
 | Method | Description |
 |--------|-------------|
-| `SetScanFrequency(frequency time.Duration) bool` | Set how often to scan for expired items (default: 1 minute) |
 | `SetSizeLimit(limit int64)` | Set maximum cache size (0 to disable) |
 | `GetSizeLimit() int64` | Get current size limit |
 | `GetCurrentSize() int64` | Get current total size of all entries |
 | `Statistics() CacheStatistics` | Get cache statistics (hits, misses, counts) |
-| `SetExpirationStrategy(s ExpirationStrategy)` | Set expiration strategy (Auto/TimingWheel/PriorityQueue) |
-| `SetShortTTLThreshold(d time.Duration)` | Set threshold for short TTL (default: 1 hour) |
 | `ExpirationStats() ExpirationManagerStats` | Get detailed expiration statistics |
-| `ShrinkExpirationQueue()` | Defragment internal priority queue memory |
 | `Stop()` | Stop the background expiration goroutine (call when done with cache) |
 
 ## EntryOptions
@@ -322,40 +318,15 @@ carrot.Default.Expire("settings", settings, -time.Second)
 
 ## Expiration Management
 
-Carrot uses a hybrid approach for expiration management:
+Carrot uses a hierarchical **TimingWheel** for all expiration management:
 
-| Data Structure | TTL Range | Characteristics |
-|----------------|-----------|-----------------|
-| **TimingWheel** | ≤ threshold (default: 1 hour) | O(1) batch expiration, ideal for high-frequency short TTL |
-| **ShardedPriorityQueue** | > threshold | O(log n) single-item ops, efficient for long TTL |
-| **None** | Forever | Items never placed in expiration queues |
+| Entry Type | Behavior |
+|------------|----------|
+| **TTL entries** | Managed by TimingWheel — event-driven, batch expiration at O(1) per slot |
+| **Sliding entries** | Managed by TimingWheel — lazy check on flush, O(1) Read with no data structure mutation |
+| **Forever entries** | Not placed in any expiration queue |
 
-### Configuring Expiration Strategy
-
-```go
-// Option 1: Adjust threshold (default: 1 hour)
-// TTL ≤ 5 minutes → TimingWheel, TTL > 5 minutes → ShardedPriorityQueue
-cache.SetShortTTLThreshold(5 * time.Minute)
-
-// Option 2: Force specific strategy
-cache.SetExpirationStrategy(carrot.StrategyTimingWheel)    // All items use TimingWheel
-cache.SetExpirationStrategy(carrot.StrategyPriorityQueue)  // All items use ShardedPriorityQueue
-cache.SetExpirationStrategy(carrot.StrategyAuto)           // Auto-select based on TTL (default)
-
-// View statistics
-emStats := cache.ExpirationStats()
-fmt.Printf("Short TTL ratio: %.2f%%\n",
-    float64(emStats.TwAddCount) / float64(emStats.TwAddCount + emStats.SpqAddCount) * 100)
-```
-
-### Recommended Threshold Settings
-
-| Use Case | Recommended Threshold | Description |
-|----------|----------------------|-------------|
-| General purpose | 1 hour (default) | Balanced performance |
-| High-frequency short TTL | 5-15 minutes | More items use TimingWheel |
-| Mostly long TTL | 24 hours | Almost all use ShardedPriorityQueue |
-| Ultra-short TTL | 1 minute | Only very short TTL uses TimingWheel |
+The TimingWheel uses overflow wheels (up to 10 levels) to support arbitrary TTL ranges — from milliseconds to days and beyond.
 
 ### Resource Cleanup
 
@@ -373,11 +344,9 @@ Create separate cache instances for different purposes.
 ```go
 // Create typed cache instances (recommended)
 sessionCache := carrot.New[string, *Session]()
-sessionCache.SetScanFrequency(30 * time.Second)
 sessionCache.SetSizeLimit(10000)
 
 dataCache := carrot.New[string, QueryResult]()
-dataCache.SetScanFrequency(5 * time.Minute)
 
 // Use independently with type safety
 sessionCache.Sliding("user:123", session, 30*time.Minute)
@@ -397,8 +366,7 @@ stats := carrot.Default.Statistics()
 fmt.Printf("Total Hits: %d\n", stats.TotalHits())
 fmt.Printf("Total Misses: %d\n", stats.TotalMisses())
 fmt.Printf("Current Items: %d\n", stats.UsageCount())
-fmt.Printf("TimingWheel Items: %d\n", stats.TwCount())      // Short TTL items
-fmt.Printf("PriorityQueue Items: %d\n", stats.PqCount())    // Long TTL items
+fmt.Printf("TimingWheel Items: %d\n", stats.TwCount())
 
 // Calculate hit rate
 total := stats.TotalHits() + stats.TotalMisses()
@@ -409,8 +377,7 @@ if total > 0 {
 
 // Detailed expiration statistics
 emStats := carrot.Default.ExpirationStats()
-fmt.Printf("TW Expirations: %d\n", emStats.TwExpireCount)
-fmt.Printf("SPQ Expirations: %d\n", emStats.SpqExpireCount)
+fmt.Printf("Expirations: %d\n", emStats.ExpireCount)
 fmt.Printf("Forever Items: %d\n", emStats.ForeverCount)
 ```
 
@@ -419,7 +386,6 @@ fmt.Printf("Forever Items: %d\n", emStats.ForeverCount)
 Carrot is designed for concurrent use:
 
 - `sync.Map` for lock-free cache entry storage
-- Sharded priority queue with per-shard locks for high concurrency
 - TimingWheel with slot-level locks for efficient batch expiration
 - `atomic` operations for cache entry fields (priority, expiration, statistics)
 - CAS (Compare-And-Swap) ensures callbacks execute exactly once
@@ -449,7 +415,7 @@ Carrot is optimized for high-performance scenarios, comparable to .NET MemoryCac
 | Concurrent scaling | Excellent | Excellent |
 | Memory overhead | Low | Low |
 
-\* Write latency includes priority queue maintenance for automatic expiration
+\* Write latency includes TimingWheel registration for automatic expiration
 
 ### Running Benchmarks
 

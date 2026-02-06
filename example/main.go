@@ -127,10 +127,6 @@ func demonstrateBasicUsage() {
 	// 使用 int 作為鍵，User 結構體作為值的快取
 	userCache := carrot.New[int, User]()
 
-	// Set scan frequency (default is 1 minute)
-	// 設定掃描頻率（預設為 1 分鐘）
-	userCache.SetScanFrequency(time.Second)
-
 	// Store and read User structs - type safe!
 	// 儲存和讀取 User 結構體 - 型別安全！
 	user1 := User{ID: 1, Name: "Alice", Email: "alice@example.com", IsActive: true}
@@ -175,7 +171,6 @@ func demonstrateExpirationPolicies() {
 	// Cache with string key and Product struct value
 	// 使用 string 作為鍵，Product 結構體作為值的快取
 	productCache := carrot.New[string, Product]()
-	productCache.SetScanFrequency(100 * time.Millisecond)
 
 	// Forever - never expires
 	// Forever - 永不過期
@@ -423,7 +418,6 @@ func demonstrateEvictionCallback() {
 	// Cache with int64 key and User struct value
 	// 使用 int64 作為鍵，User 結構體作為值的快取
 	sessionCache := carrot.New[int64, User]()
-	sessionCache.SetScanFrequency(50 * time.Millisecond)
 
 	// Set with callback
 	// 設定帶有回呼的項目
@@ -618,7 +612,7 @@ func demonstrateStatistics() {
 	log.Printf("  Total Hits / 總命中: %d", stats.TotalHits())
 	log.Printf("  Total Misses / 總未命中: %d", stats.TotalMisses())
 	log.Printf("  Usage Count / 使用計數: %d", stats.UsageCount())
-	log.Printf("  PQ Count / 優先佇列計數: %d", stats.PqCount())
+	log.Printf("  TW Count / 時間輪計數: %d", stats.TwCount())
 	assertEqual(int(stats.TotalHits()), 5, "Should have 5 hits")
 	assertEqual(int(stats.TotalMisses()), 3, "Should have 3 misses")
 	assertEqual(stats.UsageCount(), 3, "Should have 3 items in cache")

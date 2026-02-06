@@ -22,18 +22,6 @@ func TestExpirationManagerCreate(t *testing.T) {
 	if em.tw == nil {
 		t.Error("TimingWheel should be initialized")
 	}
-
-	if em.spq == nil {
-		t.Error("ShardedPriorityQueue should be initialized")
-	}
-
-	if em.Threshold() != DefaultShortTTLThreshold {
-		t.Errorf("Threshold() = %v, want %v", em.Threshold(), DefaultShortTTLThreshold)
-	}
-
-	if em.Strategy() != StrategyAuto {
-		t.Errorf("Strategy() = %v, want StrategyAuto", em.Strategy())
-	}
 }
 
 // TestExpirationManagerStartStop tests Start and Stop.
@@ -51,7 +39,7 @@ func TestExpirationManagerStartStop(t *testing.T) {
 	}
 }
 
-// TestExpirationManagerRouting_Forever tests Forever items routing.
+// TestExpirationManagerRouting_Forever tests Forever items are not added to TimingWheel.
 func TestExpirationManagerRouting_Forever(t *testing.T) {
 	em := newExpirationManager(func(ce *cacheEntry) {})
 	defer em.Stop()
@@ -62,178 +50,50 @@ func TestExpirationManagerRouting_Forever(t *testing.T) {
 
 	em.Add(ce)
 
-	if atomic.LoadInt32(&ce.expirationSource) != expirationSourceNone {
-		t.Error("Forever items should have expirationSourceNone")
-	}
-
 	stats := em.Stats()
 	if stats.ForeverCount != 1 {
 		t.Errorf("ForeverCount = %d, want 1", stats.ForeverCount)
 	}
-	if stats.TwAddCount != 0 {
-		t.Errorf("TwAddCount = %d, want 0", stats.TwAddCount)
-	}
-	if stats.SpqAddCount != 0 {
-		t.Errorf("SpqAddCount = %d, want 0", stats.SpqAddCount)
+	if stats.AddCount != 0 {
+		t.Errorf("AddCount = %d, want 0", stats.AddCount)
 	}
 }
 
-// TestExpirationManagerRouting_ShortTTL tests short TTL items routing to TimingWheel.
-func TestExpirationManagerRouting_ShortTTL(t *testing.T) {
-	em := newExpirationManager(func(ce *cacheEntry) {})
-	em.Start()
-	defer em.Stop()
-
-	now := time.Now().UnixNano()
-	ce := &cacheEntry{
-		absoluteExpiration: now + int64(30*time.Minute), // 30 minutes < 1 hour threshold
-		priority:           now + int64(30*time.Minute),
-	}
-
-	em.Add(ce)
-
-	if atomic.LoadInt32(&ce.expirationSource) != expirationSourceTimingWheel {
-		t.Error("Short TTL items should go to TimingWheel")
-	}
-
-	stats := em.Stats()
-	if stats.TwAddCount != 1 {
-		t.Errorf("TwAddCount = %d, want 1", stats.TwAddCount)
-	}
-
-	if em.TimingWheelCount() != 1 {
-		t.Errorf("TimingWheelCount() = %d, want 1", em.TimingWheelCount())
-	}
-}
-
-// TestExpirationManagerRouting_LongTTL tests long TTL items routing to ShardedPQueue.
-func TestExpirationManagerRouting_LongTTL(t *testing.T) {
-	em := newExpirationManager(func(ce *cacheEntry) {})
-	defer em.Stop()
-
-	now := time.Now().UnixNano()
-	ce := &cacheEntry{
-		absoluteExpiration: now + int64(2*time.Hour), // 2 hours > 1 hour threshold
-		priority:           now + int64(2*time.Hour),
-	}
-
-	em.Add(ce)
-
-	if atomic.LoadInt32(&ce.expirationSource) != expirationSourcePriorityQueue {
-		t.Error("Long TTL items should go to ShardedPQueue")
-	}
-
-	stats := em.Stats()
-	if stats.SpqAddCount != 1 {
-		t.Errorf("SpqAddCount = %d, want 1", stats.SpqAddCount)
-	}
-
-	if em.PriorityQueueCount() != 1 {
-		t.Errorf("PriorityQueueCount() = %d, want 1", em.PriorityQueueCount())
-	}
-}
-
-// TestExpirationManagerRouting_Strategy tests strategy override.
-func TestExpirationManagerRouting_Strategy(t *testing.T) {
+// TestExpirationManagerRouting_TTL tests all TTL items go to TimingWheel.
+func TestExpirationManagerRouting_TTL(t *testing.T) {
 	em := newExpirationManager(func(ce *cacheEntry) {})
 	em.Start()
 	defer em.Stop()
 
 	now := time.Now().UnixNano()
 
-	// Force all items to TimingWheel
-	em.SetStrategy(StrategyTimingWheel)
-
+	// Short TTL
 	ce1 := &cacheEntry{
-		absoluteExpiration: now + int64(2*time.Hour), // Long TTL
-		priority:           now + int64(2*time.Hour),
+		absoluteExpiration: now + int64(30*time.Minute),
+		priority:           now + int64(30*time.Minute),
 	}
 	em.Add(ce1)
 
-	if atomic.LoadInt32(&ce1.expirationSource) != expirationSourceTimingWheel {
-		t.Error("With StrategyTimingWheel, long TTL items should go to TimingWheel")
-	}
-
-	// Force all items to PriorityQueue
-	em.SetStrategy(StrategyPriorityQueue)
-
+	// Long TTL (previously went to SPQ, now also goes to TW)
 	ce2 := &cacheEntry{
-		absoluteExpiration: now + int64(30*time.Minute), // Short TTL
-		priority:           now + int64(30*time.Minute),
+		absoluteExpiration: now + int64(2*time.Hour),
+		priority:           now + int64(2*time.Hour),
 	}
 	em.Add(ce2)
 
-	if atomic.LoadInt32(&ce2.expirationSource) != expirationSourcePriorityQueue {
-		t.Error("With StrategyPriorityQueue, short TTL items should go to PriorityQueue")
-	}
-}
-
-// TestExpirationManagerSetThreshold tests threshold configuration.
-func TestExpirationManagerSetThreshold(t *testing.T) {
-	em := newExpirationManager(func(ce *cacheEntry) {})
-	em.Start()
-	defer em.Stop()
-
-	// Test invalid values
-	em.SetThreshold(0)
-	if em.Threshold() != DefaultShortTTLThreshold {
-		t.Error("SetThreshold(0) should be ignored")
+	stats := em.Stats()
+	if stats.AddCount != 2 {
+		t.Errorf("AddCount = %d, want 2", stats.AddCount)
 	}
 
-	em.SetThreshold(-time.Second)
-	if em.Threshold() != DefaultShortTTLThreshold {
-		t.Error("SetThreshold(-1s) should be ignored")
-	}
-
-	// Test valid value
-	em.SetThreshold(5 * time.Minute)
-	if em.Threshold() != 5*time.Minute {
-		t.Errorf("Threshold() = %v, want 5m", em.Threshold())
-	}
-
-	// Now items with TTL > 5 minutes should go to PriorityQueue
-	now := time.Now().UnixNano()
-	ce := &cacheEntry{
-		absoluteExpiration: now + int64(10*time.Minute), // 10 min > 5 min threshold
-		priority:           now + int64(10*time.Minute),
-	}
-	em.Add(ce)
-
-	if atomic.LoadInt32(&ce.expirationSource) != expirationSourcePriorityQueue {
-		t.Error("With 5min threshold, 10min TTL items should go to PriorityQueue")
-	}
-}
-
-// TestExpirationManagerSetStrategy tests strategy validation.
-func TestExpirationManagerSetStrategy(t *testing.T) {
-	em := newExpirationManager(func(ce *cacheEntry) {})
-
-	// Test invalid values
-	em.SetStrategy(ExpirationStrategy(-1))
-	if em.Strategy() != StrategyAuto {
-		t.Error("SetStrategy(-1) should be ignored")
-	}
-
-	em.SetStrategy(ExpirationStrategy(99))
-	if em.Strategy() != StrategyAuto {
-		t.Error("SetStrategy(99) should be ignored")
-	}
-
-	// Test valid values
-	em.SetStrategy(StrategyTimingWheel)
-	if em.Strategy() != StrategyTimingWheel {
-		t.Errorf("Strategy() = %v, want StrategyTimingWheel", em.Strategy())
-	}
-
-	em.SetStrategy(StrategyPriorityQueue)
-	if em.Strategy() != StrategyPriorityQueue {
-		t.Errorf("Strategy() = %v, want StrategyPriorityQueue", em.Strategy())
+	if em.TimingWheelCount() != 2 {
+		t.Errorf("TimingWheelCount() = %d, want 2", em.TimingWheelCount())
 	}
 }
 
 // TestExpirationManagerRemove tests Remove functionality.
 // 設計文件 Section 4.4.2: RemoveCount 計數的是「呼叫 Remove() 的次數」，
-// 即使 ce.deleted=1 也會計數。
+// 即使 CAS 失敗也會計數。
 func TestExpirationManagerRemove(t *testing.T) {
 	em := newExpirationManager(func(ce *cacheEntry) {})
 	em.Start()
@@ -241,53 +101,34 @@ func TestExpirationManagerRemove(t *testing.T) {
 
 	now := time.Now().UnixNano()
 
-	// Add item to TimingWheel
-	ce1 := &cacheEntry{
+	ce := &cacheEntry{
 		absoluteExpiration: now + int64(30*time.Minute),
 		priority:           now + int64(30*time.Minute),
 	}
-	em.Add(ce1)
+	em.Add(ce)
 
 	// Remove should succeed on first call (CAS 成功)
-	if !em.Remove(ce1) {
+	if !em.Remove(ce) {
 		t.Error("First Remove should succeed")
 	}
 
 	// Remove should fail on second call (CAS 失敗，但仍計數)
-	if em.Remove(ce1) {
+	if em.Remove(ce) {
 		t.Error("Second Remove should fail")
 	}
 
 	stats := em.Stats()
-	// 設計文件：即使 CAS 失敗也要計數，所以 TwRemoveCount=2
-	if stats.TwRemoveCount != 2 {
-		t.Errorf("TwRemoveCount = %d, want 2 (both calls counted)", stats.TwRemoveCount)
-	}
-
-	// Add item to PriorityQueue
-	ce2 := &cacheEntry{
-		absoluteExpiration: now + int64(2*time.Hour),
-		priority:           now + int64(2*time.Hour),
-	}
-	em.Add(ce2)
-
-	if !em.Remove(ce2) {
-		t.Error("Remove from PriorityQueue should succeed")
-	}
-
-	// 第二次 Remove ce2 (CAS 失敗，但仍計數)
-	em.Remove(ce2)
-
-	stats = em.Stats()
-	// 設計文件：即使 CAS 失敗也要計數，所以 SpqRemoveCount=2
-	if stats.SpqRemoveCount != 2 {
-		t.Errorf("SpqRemoveCount = %d, want 2 (both calls counted)", stats.SpqRemoveCount)
+	// 設計文件：即使 CAS 失敗也要計數，所以 RemoveCount=2
+	if stats.RemoveCount != 2 {
+		t.Errorf("RemoveCount = %d, want 2 (both calls counted)", stats.RemoveCount)
 	}
 }
 
 // TestExpirationManagerRemove_Forever tests Remove on Forever items.
 func TestExpirationManagerRemove_Forever(t *testing.T) {
 	em := newExpirationManager(func(ce *cacheEntry) {})
+	em.Start()
+	defer em.Stop()
 
 	ce := &cacheEntry{
 		absoluteExpiration: -1, // Forever
@@ -295,15 +136,24 @@ func TestExpirationManagerRemove_Forever(t *testing.T) {
 
 	em.Add(ce)
 
+	// Forever 項目不應進入 TW，Count 應為 0
+	if got := em.Count(); got != 0 {
+		t.Errorf("after Add Forever, Count = %d, want 0", got)
+	}
+
 	// Remove should succeed (CAS)
 	if !em.Remove(ce) {
 		t.Error("Remove on Forever item should succeed (CAS)")
 	}
 
-	// Counters should not increase for Forever items
+	// 修復驗證：Count 不應變成負數
+	if got := em.Count(); got != 0 {
+		t.Errorf("after Remove Forever, Count = %d, want 0 (must not go negative)", got)
+	}
+
 	stats := em.Stats()
-	if stats.TwRemoveCount != 0 || stats.SpqRemoveCount != 0 {
-		t.Error("Forever items should not increment remove counters")
+	if stats.RemoveCount != 1 {
+		t.Errorf("RemoveCount = %d, want 1", stats.RemoveCount)
 	}
 }
 
@@ -315,19 +165,12 @@ func TestExpirationManagerClear(t *testing.T) {
 
 	now := time.Now().UnixNano()
 
-	// Add items to both structures
-	for i := 0; i < 5; i++ {
+	// Add items with varying TTLs (all go to TimingWheel now)
+	for i := 0; i < 10; i++ {
+		ttl := time.Duration(i%3+1) * time.Hour
 		ce := &cacheEntry{
-			absoluteExpiration: now + int64(30*time.Minute),
-			priority:           now + int64(30*time.Minute),
-		}
-		em.Add(ce)
-	}
-
-	for i := 0; i < 5; i++ {
-		ce := &cacheEntry{
-			absoluteExpiration: now + int64(2*time.Hour),
-			priority:           now + int64(2*time.Hour),
+			absoluteExpiration: now + int64(ttl),
+			priority:           now + int64(ttl),
 		}
 		em.Add(ce)
 	}
@@ -344,130 +187,8 @@ func TestExpirationManagerClear(t *testing.T) {
 
 	// Stats should be preserved (cumulative)
 	stats := em.Stats()
-	if stats.TwAddCount != 5 {
-		t.Errorf("TwAddCount after Clear = %d, want 5", stats.TwAddCount)
-	}
-	if stats.SpqAddCount != 5 {
-		t.Errorf("SpqAddCount after Clear = %d, want 5", stats.SpqAddCount)
-	}
-}
-
-// TestExpirationManagerDequeue tests Dequeue from PriorityQueue.
-func TestExpirationManagerDequeue(t *testing.T) {
-	expiredCount := int64(0)
-	em := newExpirationManager(func(ce *cacheEntry) {
-		atomic.AddInt64(&expiredCount, 1)
-	})
-
-	now := time.Now().UnixNano()
-
-	// Add expired item to PriorityQueue (long TTL but already expired)
-	ce := &cacheEntry{
-		absoluteExpiration: now - int64(time.Second), // Already expired
-		priority:           now - int64(time.Second),
-	}
-	// Force to PriorityQueue
-	em.SetStrategy(StrategyPriorityQueue)
-	em.Add(ce)
-
-	// Dequeue should return the item
-	result, ok := em.Dequeue(now)
-	if !ok {
-		t.Error("Dequeue should return expired item")
-	}
-	if result != ce {
-		t.Error("Dequeue should return the correct item")
-	}
-
-	stats := em.Stats()
-	if stats.SpqExpireCount != 1 {
-		t.Errorf("SpqExpireCount = %d, want 1", stats.SpqExpireCount)
-	}
-}
-
-// TestDequeue_RemoveAfterDequeue_NoDirtyCountIncrease 測試 Dequeue 後 Remove 不會增加 dirtyCount
-// 這是修復的 Bug：SPQ 出隊後不應再標記為 dirty
-func TestDequeue_RemoveAfterDequeue_NoDirtyCountIncrease(t *testing.T) {
-	em := newExpirationManager(func(ce *cacheEntry) {})
-	em.SetStrategy(StrategyPriorityQueue)
-
-	now := time.Now().UnixNano()
-
-	// 加入多個過期項目
-	entries := make([]*cacheEntry, 10)
-	for i := 0; i < 10; i++ {
-		entries[i] = &cacheEntry{
-			absoluteExpiration: now - int64(time.Second),
-			priority:           now - int64(time.Second),
-		}
-		em.Add(entries[i])
-	}
-
-	// 確認初始狀態
-	if em.PriorityQueueCount() != 10 {
-		t.Errorf("Initial PriorityQueueCount = %d, want 10", em.PriorityQueueCount())
-	}
-
-	// Dequeue 所有項目，然後對每個呼叫 Remove
-	for i := 0; i < 10; i++ {
-		ce, ok := em.Dequeue(now)
-		if !ok {
-			t.Fatalf("Dequeue %d failed", i)
-		}
-
-		// Dequeue 後 expirationSource 應該被設為 None
-		source := atomic.LoadInt32(&ce.expirationSource)
-		if source != expirationSourceNone {
-			t.Errorf("After Dequeue, expirationSource = %d, want %d (None)", source, expirationSourceNone)
-		}
-
-		// Remove 應該不會再增加 dirtyCount（因為項目已經不在 heap 中）
-		em.Remove(ce)
-	}
-
-	// PriorityQueueCount 應該為 0，不應為負數
-	pqCount := em.PriorityQueueCount()
-	if pqCount != 0 {
-		t.Errorf("After Dequeue+Remove, PriorityQueueCount = %d, want 0", pqCount)
-	}
-	if pqCount < 0 {
-		t.Errorf("PriorityQueueCount is negative: %d (dirtyCount exceeded totalCount)", pqCount)
-	}
-}
-
-// TestDequeue_SlidingUpdate_NotEvictedPrematurely 測試 Sliding 項目更新後不會被錯誤逐出
-// 這是修復的 Bug：全域最小值出隊前需要重新校驗是否過期
-func TestDequeue_SlidingUpdate_NotEvictedPrematurely(t *testing.T) {
-	em := newExpirationManager(func(ce *cacheEntry) {})
-	em.SetStrategy(StrategyPriorityQueue)
-
-	now := time.Now().UnixNano()
-
-	// 建立一個 Sliding 項目，設定為「剛好過期」
-	ce := &cacheEntry{
-		absoluteExpiration: now - int64(time.Millisecond), // 剛好過期
-		priority:           now - int64(time.Millisecond),
-		lastAccessed:       now - int64(time.Second),
-		slidingExpiration:  time.Minute,
-		kind:               KindSliding,
-	}
-	em.Add(ce)
-
-	// 模擬 Read 更新 priority（在 Dequeue 掃描期間可能發生）
-	newExp := now + int64(time.Minute)
-	ce.setPriority(newExp)
-	ce.setAbsoluteExpiration(newExp)
-	ce.setLastAccessed(now)
-
-	// Dequeue 應該不會返回這個項目（因為 priority 已經更新為未過期）
-	result, ok := em.Dequeue(now)
-	if ok && result == ce {
-		t.Error("Dequeue should not return the sliding item after priority update")
-	}
-
-	// 項目應該仍在佇列中
-	if em.PriorityQueueCount() != 1 {
-		t.Errorf("PriorityQueueCount = %d, want 1", em.PriorityQueueCount())
+	if stats.AddCount != 10 {
+		t.Errorf("AddCount after Clear = %d, want 10", stats.AddCount)
 	}
 }
 
@@ -491,8 +212,8 @@ func TestExpirationManagerConcurrency(t *testing.T) {
 			now := time.Now().UnixNano()
 
 			for i := 0; i < numOperations; i++ {
-				// Add items with varying TTLs
-				ttl := time.Duration(i%3+1) * time.Hour // 1h, 2h, or 3h
+				// Add items with varying TTLs (all go to TimingWheel now)
+				ttl := time.Duration(i%3+1) * time.Hour
 				ce := &cacheEntry{
 					absoluteExpiration: now + int64(ttl),
 					priority:           now + int64(ttl),
@@ -511,9 +232,8 @@ func TestExpirationManagerConcurrency(t *testing.T) {
 
 	// Verify counts are reasonable
 	stats := em.Stats()
-	totalAdds := stats.TwAddCount + stats.SpqAddCount
-	if totalAdds != int64(numGoroutines*numOperations) {
-		t.Errorf("Total adds = %d, want %d", totalAdds, numGoroutines*numOperations)
+	if stats.AddCount != int64(numGoroutines*numOperations) {
+		t.Errorf("AddCount = %d, want %d", stats.AddCount, numGoroutines*numOperations)
 	}
 }
 
@@ -620,12 +340,11 @@ func TestTimingWheelSliding(t *testing.T) {
 // 使用 go test -race 執行以檢測數據競態
 // =============================================================================
 
-// TestRace_ForgetAndExpire 測試 Forget 與 handleExpired 同時處理同一項目
+// TestRace_ForgetAndExpire 測試 Forget 與 TimingWheel 過期同時處理同一項目
 // 確保 callback 只觸發一次，不會重複扣減計數
 func TestRace_ForgetAndExpire(t *testing.T) {
 	var callbackCount int64
 	cache := newCacheCoherent()
-	cache.SetScanFrequency(5 * time.Millisecond)
 
 	// 設定極短的 TTL 來增加競態發生機率
 	for i := 0; i < 100; i++ {
@@ -648,16 +367,9 @@ func TestRace_ForgetAndExpire(t *testing.T) {
 		}
 	}()
 
-	// Goroutine 2: 觸發過期掃描
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		time.Sleep(15 * time.Millisecond)
-		cache.flushExpired(time.Now().UTC().UnixNano())
-	}()
-
 	wg.Wait()
-	time.Sleep(50 * time.Millisecond) // 等待所有非同步 callback 完成
+	// 等待 TimingWheel 處理過期項目及異步 callback 完成
+	time.Sleep(200 * time.Millisecond)
 
 	// 每個項目的 callback 應該只觸發一次
 	finalCount := atomic.LoadInt64(&callbackCount)
@@ -672,11 +384,10 @@ func TestRace_ForgetAndExpire(t *testing.T) {
 	}
 }
 
-// TestRace_KeepAndExpire 測試 keep 替換與 handleExpired 同時處理
+// TestRace_KeepAndExpire 測試 keep 替換與 TimingWheel 過期同時處理
 func TestRace_KeepAndExpire(t *testing.T) {
 	var callbackCount int64
 	cache := newCacheCoherent()
-	cache.SetScanFrequency(5 * time.Millisecond)
 
 	var wg sync.WaitGroup
 
@@ -695,18 +406,9 @@ func TestRace_KeepAndExpire(t *testing.T) {
 		}
 	}()
 
-	// Goroutine 2: 觸發過期掃描
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for i := 0; i < 20; i++ {
-			time.Sleep(10 * time.Millisecond)
-			cache.flushExpired(time.Now().UTC().UnixNano())
-		}
-	}()
-
 	wg.Wait()
-	time.Sleep(50 * time.Millisecond)
+	// 等待 TimingWheel 處理過期項目及異步 callback 完成
+	time.Sleep(200 * time.Millisecond)
 
 	// 至少應該有一些 callback（99 次替換 + 可能的過期）
 	finalCount := atomic.LoadInt64(&callbackCount)
@@ -721,10 +423,9 @@ func TestRace_KeepAndExpire(t *testing.T) {
 	}
 }
 
-// TestRace_ReadSlidingAndExpire 測試 Read 更新 Sliding 與 expireSlot 同時處理
+// TestRace_ReadSlidingAndExpire 測試 Read 更新 Sliding 與 TimingWheel 過期同時處理
 func TestRace_ReadSlidingAndExpire(t *testing.T) {
 	cache := newCacheCoherent()
-	cache.SetScanFrequency(10 * time.Millisecond)
 
 	// 建立 Sliding 項目
 	for i := 0; i < 50; i++ {
@@ -746,17 +447,9 @@ func TestRace_ReadSlidingAndExpire(t *testing.T) {
 		}
 	}()
 
-	// Goroutine 2: 觸發過期掃描
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for i := 0; i < 10; i++ {
-			time.Sleep(10 * time.Millisecond)
-			cache.flushExpired(time.Now().UTC().UnixNano())
-		}
-	}()
-
 	wg.Wait()
+	// 等待 TimingWheel 處理
+	time.Sleep(100 * time.Millisecond)
 
 	// 驗證 Statistics 的一致性
 	stats := cache.Statistics()
@@ -768,7 +461,6 @@ func TestRace_ReadSlidingAndExpire(t *testing.T) {
 // TestRace_RescheduleAndRemove 測試 reschedule 與 Remove 的競態
 func TestRace_RescheduleAndRemove(t *testing.T) {
 	cache := newCacheCoherent()
-	cache.SetScanFrequency(10 * time.Millisecond)
 
 	// 建立 Sliding 項目
 	for i := 0; i < 100; i++ {
@@ -810,42 +502,26 @@ func TestRace_RescheduleAndRemove(t *testing.T) {
 	}
 }
 
-// TestRace_MultipleExpireHandlers 測試多個 goroutine 同時處理過期項目
-// 這個測試驗證當多個 goroutine 同時嘗試處理相同的過期項目時，
-// CAS 機制確保每個項目的 callback 只被觸發一次
-func TestRace_MultipleExpireHandlers(t *testing.T) {
+// TestRace_ConcurrentExpiration 測試 TimingWheel 處理大量同時過期的項目
+// 驗證每個項目的 callback 只被觸發一次
+// 注意：預設 TimingWheel tick = 1 秒，TTL 必須 > 1 秒才能確保 TW 處理
+func TestRace_ConcurrentExpiration(t *testing.T) {
 	var callbackCount int64
 	cache := newCacheCoherent()
 
-	// 強制使用 SPQ 策略，這樣 flushExpired 可以處理
-	cache.SetExpirationStrategy(StrategyPriorityQueue)
-	cache.SetScanFrequency(10 * time.Millisecond)
-
-	// 設定會進入 SPQ 的項目
+	// 設定會同時過期的項目（TTL > 預設 tick 1s）
 	for i := 0; i < 50; i++ {
 		key := fmt.Sprintf("key-%d", i)
 		cache.Set(key, i, EntryOptions{
-			TimeToLive: 30 * time.Millisecond,
+			TimeToLive: 2 * time.Second,
 			PostEvictionCallback: func(k, v any, reason EvictionReason) {
 				atomic.AddInt64(&callbackCount, 1)
 			},
 		})
 	}
 
-	var wg sync.WaitGroup
-
-	// 多個 goroutine 同時觸發過期掃描
-	for g := 0; g < 5; g++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			time.Sleep(40 * time.Millisecond)
-			cache.flushExpired(time.Now().UTC().UnixNano())
-		}()
-	}
-
-	wg.Wait()
-	time.Sleep(100 * time.Millisecond) // 等待異步 callback 完成
+	// 等待 TimingWheel 處理過期項目及異步 callback 完成
+	time.Sleep(4 * time.Second)
 
 	// 每個項目只應觸發一次 callback
 	finalCount := atomic.LoadInt64(&callbackCount)
@@ -854,7 +530,7 @@ func TestRace_MultipleExpireHandlers(t *testing.T) {
 	}
 }
 
-// TestCAS_CallbackOnlyOnce_Forget 測試 Forget 與 Expire 只觸發一次 callback
+// TestCAS_CallbackOnlyOnce_Forget 測試 Forget 與 TimingWheel 過期只觸發一次 callback
 func TestCAS_CallbackOnlyOnce_Forget(t *testing.T) {
 	var callbackCount int64
 	cache := newCacheCoherent()
@@ -878,16 +554,9 @@ func TestCAS_CallbackOnlyOnce_Forget(t *testing.T) {
 		}()
 	}
 
-	// 同時觸發過期掃描
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		time.Sleep(60 * time.Millisecond)
-		cache.flushExpired(time.Now().UTC().UnixNano())
-	}()
-
 	wg.Wait()
-	time.Sleep(50 * time.Millisecond)
+	// 等待 TimingWheel 處理過期及異步 callback 完成
+	time.Sleep(200 * time.Millisecond)
 
 	// Callback 只應觸發一次
 	finalCount := atomic.LoadInt64(&callbackCount)
@@ -925,7 +594,6 @@ func TestCAS_CallbackOnlyOnce_Replace(t *testing.T) {
 func TestCAS_CallbackOnlyOnce_Multiple(t *testing.T) {
 	var callbackCount int64
 	cache := newCacheCoherent()
-	cache.SetScanFrequency(5 * time.Millisecond)
 
 	key := "contested-key"
 	cache.Set(key, "initial", EntryOptions{
@@ -958,16 +626,9 @@ func TestCAS_CallbackOnlyOnce_Multiple(t *testing.T) {
 		})
 	}()
 
-	// Goroutine 3: 觸發過期掃描
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		time.Sleep(25 * time.Millisecond)
-		cache.flushExpired(time.Now().UTC().UnixNano())
-	}()
-
 	wg.Wait()
-	time.Sleep(150 * time.Millisecond)
+	// 等待 TimingWheel 處理過期及異步 callback 完成
+	time.Sleep(200 * time.Millisecond)
 
 	// 原始項目的 callback 只應觸發一次
 	// 替換的新項目可能也觸發一次（共 1-2 次）
@@ -980,7 +641,6 @@ func TestCAS_CallbackOnlyOnce_Multiple(t *testing.T) {
 // TestConcurrency_TotalCount 測試高並發下 totalCount 一致性
 func TestConcurrency_TotalCount(t *testing.T) {
 	cache := newCacheCoherent()
-	cache.SetScanFrequency(10 * time.Millisecond)
 
 	var wg sync.WaitGroup
 	numGoroutines := 10
@@ -1021,10 +681,9 @@ func TestConcurrency_TotalCount(t *testing.T) {
 		t.Errorf("TwCount 不應為負數: %d", twCount)
 	}
 
-	// pqCount + twCount 應該接近或等於 usageCount
-	// （可能有些 Forever 項目不在任何佇列中）
-	totalInQueues := stats.PqCount() + stats.TwCount()
-	if totalInQueues > stats.UsageCount() {
-		t.Errorf("佇列項目數 (%d) 不應超過 usageCount (%d)", totalInQueues, stats.UsageCount())
+	// twCount 應該不超過 usageCount
+	// （可能有些 Forever 項目不在佇列中）
+	if twCount > stats.UsageCount() {
+		t.Errorf("TwCount (%d) 不應超過 usageCount (%d)", twCount, stats.UsageCount())
 	}
 }

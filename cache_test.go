@@ -60,7 +60,6 @@ func TestDelayNeverExpire(t *testing.T) {
 
 	// Wait and verify it's still there
 	time.Sleep(50 * time.Millisecond)
-	cache.flushExpired(time.Now().UTC().UnixNano())
 
 	if !cache.Have("forever-key") {
 		t.Error("Item with negative duration should never expire")
@@ -93,27 +92,6 @@ func TestUntilPastTime(t *testing.T) {
 
 	if cache.Have("test-key") {
 		t.Error("Until with past time should remove the existing item")
-	}
-}
-
-// TestSetScanFrequencyNegative tests SetScanFrequency with negative duration.
-func TestSetScanFrequencyNegative(t *testing.T) {
-	cache := NewCache()
-	defer cache.Reset()
-
-	result := cache.SetScanFrequency(-time.Second)
-	if result {
-		t.Error("SetScanFrequency should return false for negative duration")
-	}
-
-	result = cache.SetScanFrequency(0)
-	if result {
-		t.Error("SetScanFrequency should return false for zero duration")
-	}
-
-	result = cache.SetScanFrequency(time.Second)
-	if !result {
-		t.Error("SetScanFrequency should return true for positive duration")
 	}
 }
 
@@ -187,10 +165,9 @@ func TestCacheStatisticsGetters(t *testing.T) {
 	cache.Forever("key1", "value1")
 	cache.Forever("key2", "value2")
 
-	// Add items with TTL (will be in TimingWheel or PriorityQueue based on TTL)
-	// Short TTL (<=1h) goes to TimingWheel, Long TTL (>1h) goes to PriorityQueue
-	cache.Expire("key3", "value3", 30*time.Minute) // Short TTL → TimingWheel
-	cache.Expire("key4", "value4", 2*time.Hour)    // Long TTL → PriorityQueue
+	// Add items with TTL (all go to TimingWheel now)
+	cache.Expire("key3", "value3", 30*time.Minute)
+	cache.Expire("key4", "value4", 2*time.Hour)
 
 	// Hit
 	cache.Read("key1")
@@ -214,14 +191,9 @@ func TestCacheStatisticsGetters(t *testing.T) {
 	}
 
 	// Forever items are not in any queue
-	// Short TTL items go to TimingWheel
-	// Long TTL items go to PriorityQueue
-	if stats.TwCount() != 1 {
-		t.Errorf("TwCount() = %d, want 1", stats.TwCount())
-	}
-
-	if stats.PqCount() != 1 {
-		t.Errorf("PqCount() = %d, want 1", stats.PqCount())
+	// All TTL items go to TimingWheel
+	if stats.TwCount() != 2 {
+		t.Errorf("TwCount() = %d, want 2", stats.TwCount())
 	}
 }
 
@@ -262,13 +234,67 @@ func TestResetClearsEverything(t *testing.T) {
 	if stats.TotalMisses() != statsBefore.TotalMisses() {
 		t.Errorf("Reset should preserve totalMisses, got %d want %d", stats.TotalMisses(), statsBefore.TotalMisses())
 	}
-	// Reset 應清除 usageCount 和 pqCount
+	// Reset 應清除 usageCount 和 twCount
 	if stats.UsageCount() != 0 {
 		t.Error("Reset should clear usageCount")
 	}
-	if stats.PqCount() != 0 {
-		t.Error("Reset should clear pqCount")
+	if stats.TwCount() != 0 {
+		t.Error("Reset should clear twCount")
 	}
+}
+
+// TestTwCountNeverNegative verifies that TwCount does not go negative
+// when removing Forever entries or entries that were never enqueued in the TimingWheel.
+func TestTwCountNeverNegative(t *testing.T) {
+	cache := NewCache()
+
+	// Case 1: Forever 項目 Forget 後 TwCount 不應為負
+	cache.Forever("forever-key", "value")
+	stats := cache.Statistics()
+	if stats.TwCount() != 0 {
+		t.Errorf("Forever item should not be in TW, TwCount = %d", stats.TwCount())
+	}
+
+	cache.Forget("forever-key")
+	stats = cache.Statistics()
+	if stats.TwCount() < 0 {
+		t.Errorf("TwCount went negative after Forget Forever: %d", stats.TwCount())
+	}
+	if stats.TwCount() != 0 {
+		t.Errorf("TwCount should be 0 after Forget Forever, got %d", stats.TwCount())
+	}
+
+	// Case 2: 多個 Forever 項目全部 Forget
+	for i := 0; i < 100; i++ {
+		cache.Forever(i, i)
+	}
+	for i := 0; i < 100; i++ {
+		cache.Forget(i)
+	}
+	stats = cache.Statistics()
+	if stats.TwCount() != 0 {
+		t.Errorf("TwCount should be 0 after removing all Forever items, got %d", stats.TwCount())
+	}
+
+	// Case 3: 混合 Forever 和 TTL 項目
+	cache.Forever("f1", "v1")
+	cache.Expire("e1", "v1", time.Hour)
+	stats = cache.Statistics()
+	if stats.TwCount() != 1 {
+		t.Errorf("Only TTL item should be in TW, TwCount = %d, want 1", stats.TwCount())
+	}
+	cache.Forget("f1")
+	stats = cache.Statistics()
+	if stats.TwCount() != 1 {
+		t.Errorf("After Forget Forever, TTL item still in TW, TwCount = %d, want 1", stats.TwCount())
+	}
+	cache.Forget("e1")
+	stats = cache.Statistics()
+	if stats.TwCount() != 0 {
+		t.Errorf("After Forget all, TwCount = %d, want 0", stats.TwCount())
+	}
+
+	cache.Reset()
 }
 
 // TestReplaceExistingKey tests replacing an existing key with new value.

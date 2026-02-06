@@ -124,11 +124,6 @@ func (tc *TypedCache[K, V]) Reset() {
 	tc.cache.Reset()
 }
 
-// SetScanFrequency sets the frequency for scanning expired items.
-func (tc *TypedCache[K, V]) SetScanFrequency(frequency time.Duration) bool {
-	return tc.cache.SetScanFrequency(frequency)
-}
-
 // SetSizeLimit sets the maximum size limit for the cache.
 func (tc *TypedCache[K, V]) SetSizeLimit(limit int64) {
 	tc.cache.SetSizeLimit(limit)
@@ -154,27 +149,9 @@ func (tc *TypedCache[K, V]) Statistics() CacheStatistics {
 	return tc.cache.Statistics()
 }
 
-// SetExpirationStrategy sets the routing strategy for expiration management.
-// See ExpirationStrategy for available options.
-func (tc *TypedCache[K, V]) SetExpirationStrategy(s ExpirationStrategy) {
-	tc.cache.SetExpirationStrategy(s)
-}
-
-// SetShortTTLThreshold sets the threshold for routing items to TimingWheel.
-// Items with TTL <= threshold go to TimingWheel, others go to ShardedPriorityQueue.
-func (tc *TypedCache[K, V]) SetShortTTLThreshold(d time.Duration) {
-	tc.cache.SetShortTTLThreshold(d)
-}
-
 // ExpirationStats returns statistics from the expiration manager.
 func (tc *TypedCache[K, V]) ExpirationStats() ExpirationManagerStats {
 	return tc.cache.ExpirationStats()
-}
-
-// ShrinkExpirationQueue performs defragmentation on the internal priority queue.
-// See CacheCoherent.ShrinkExpirationQueue for details.
-func (tc *TypedCache[K, V]) ShrinkExpirationQueue() {
-	tc.cache.ShrinkExpirationQueue()
 }
 
 // Underlying returns the underlying CacheCoherent instance.

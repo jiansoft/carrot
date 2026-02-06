@@ -9,6 +9,13 @@ import (
 	"github.com/jiansoft/robin"
 )
 
+func equal(t *testing.T, got, want any) {
+	t.Helper()
+	if got != want {
+		t.Errorf("got %v, want %v", got, want)
+	}
+}
+
 func Test_CacheCoherent(t *testing.T) {
 	tests := []struct {
 		memoryCache *CacheCoherent
@@ -39,8 +46,8 @@ func Test_CacheCoherent(t *testing.T) {
 			s := tt.memoryCache.Statistics()
 			t.Logf("Statistics %+v", s)
 			equal(t, s.usageCount, 0)
-			// 所有項目都被 Forget 了，pqCount 和 twCount 都應該是 0
-			equal(t, s.pqCount+s.twCount, 0)
+			// 所有項目都被 Forget 了，twCount 應該是 0
+			equal(t, s.twCount, 0)
 			tt.memoryCache.Reset()
 
 			tt.memoryCache.Forget("noKey")
@@ -58,9 +65,9 @@ func Test_CacheCoherent(t *testing.T) {
 			s = tt.memoryCache.Statistics()
 			t.Logf("Statistics %+v", s)
 			equal(t, s.usageCount, tt.want)
-			// 1 小時 TTL 項目會進入 TimingWheel（TTL <= 閾值）
-			// usageCount 應該等於 pqCount + twCount
-			equal(t, s.usageCount, s.pqCount+s.twCount)
+			// 所有 TTL 項目都進入 TimingWheel
+			// usageCount 應該等於 twCount
+			equal(t, s.usageCount, s.twCount)
 		})
 	}
 }
@@ -75,7 +82,6 @@ func Test_DataRace(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			tt.memoryCache.SetScanFrequency(time.Second)
 			wg := sync.WaitGroup{}
 			wg.Add(1)
 			robin.RightNow().Do(func(loop int, m *CacheCoherent, swg *sync.WaitGroup) {
@@ -196,7 +202,6 @@ func Test_Default(t *testing.T) {
 			// 使用獨立的 cache 實例，避免跨測試統計累計問題
 			// 設計文件 Section 5.3.6: Reset 不重置 totalHits/totalMisses
 			cache := newCacheCoherent()
-			cache.SetScanFrequency(timeBase * 2)
 
 			//----  Forever ----
 			cache.Forever(tt.args.key, tt.args.val)
@@ -219,10 +224,9 @@ func Test_Default(t *testing.T) {
 				t.Fatalf("Until can't read the key:%v", tt.args.key)
 			}
 
-			<-time.After(timeBase)
-			cache.flushExpired(time.Now().UTC().UnixNano())
+			<-time.After(timeBase + 10*time.Millisecond)
 			if _, ok := cache.Read(tt.args.key); ok {
-				t.Fatalf("After calling flushExpired, Until can read the key:%v", tt.args.key)
+				t.Fatalf("After expiration, Until can read the key:%v", tt.args.key)
 			}
 			untilStat := cache.Statistics()
 			t.Logf("Until Statistics %+v", untilStat)
@@ -239,10 +243,9 @@ func Test_Default(t *testing.T) {
 				t.Fatalf("Delay can't read the key:%v", tt.args.key)
 			}
 
-			<-time.After(timeBase)
-			cache.flushExpired(time.Now().UTC().UnixNano())
+			<-time.After(timeBase + 10*time.Millisecond)
 			if _, ok := cache.Read(tt.args.key); ok {
-				t.Fatalf("After flushExpired, the key can be read by Delay:%v", tt.args.key)
+				t.Fatalf("After expiration, the key can be read by Delay:%v", tt.args.key)
 			}
 			delayStat := cache.Statistics()
 			t.Logf("Delay Statistics %+v", delayStat)
