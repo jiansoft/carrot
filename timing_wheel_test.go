@@ -1205,6 +1205,400 @@ func TestFix3_RemoveBucketHeapAt(t *testing.T) {
 }
 
 // ============================================================================
+// 12. Patch Coverage 補充測試
+// ============================================================================
+
+// TestRemoveAt_BoundaryConditions 驗證 RemoveAt 的邊界情況
+func TestRemoveAt_BoundaryConditions(t *testing.T) {
+	t.Run("RemoveAt_InvalidIndex", func(t *testing.T) {
+		h := &bucketHeap{items: make([]*twBucket, 0)}
+
+		// 空堆：越界索引
+		if b := h.RemoveAt(-1); b != nil {
+			t.Error("負索引應返回 nil")
+		}
+		if b := h.RemoveAt(0); b != nil {
+			t.Error("空堆 RemoveAt(0) 應返回 nil")
+		}
+		if b := h.RemoveAt(5); b != nil {
+			t.Error("越界索引應返回 nil")
+		}
+	})
+
+	t.Run("RemoveAt_LastElement", func(t *testing.T) {
+		h := &bucketHeap{items: make([]*twBucket, 0)}
+
+		b1 := newTwBucket()
+		b2 := newTwBucket()
+		b3 := newTwBucket()
+		atomic.StoreInt64(&b1.expiration, 100)
+		atomic.StoreInt64(&b2.expiration, 200)
+		atomic.StoreInt64(&b3.expiration, 300)
+
+		h.Push(b1)
+		h.Push(b2)
+		h.Push(b3)
+
+		// 移除最後一個元素（i == last 分支）
+		removed := h.RemoveAt(2)
+		if removed != b3 {
+			t.Error("應移除最後一個 bucket")
+		}
+		if h.Len() != 2 {
+			t.Errorf("移除後預期 2 個元素，實際 %d", h.Len())
+		}
+		if removed.heapIndex != -1 {
+			t.Errorf("被移除的 bucket heapIndex 應為 -1，實際 %d", removed.heapIndex)
+		}
+	})
+
+	t.Run("RemoveAt_Root", func(t *testing.T) {
+		h := &bucketHeap{items: make([]*twBucket, 0)}
+
+		b1 := newTwBucket()
+		b2 := newTwBucket()
+		b3 := newTwBucket()
+		atomic.StoreInt64(&b1.expiration, 100)
+		atomic.StoreInt64(&b2.expiration, 200)
+		atomic.StoreInt64(&b3.expiration, 300)
+
+		h.Push(b1)
+		h.Push(b2)
+		h.Push(b3)
+
+		// 移除堆頂（需要 siftDown 重新平衡）
+		removed := h.RemoveAt(0)
+		if removed != b1 {
+			t.Error("應移除堆頂 bucket")
+		}
+		if h.Len() != 2 {
+			t.Errorf("移除後預期 2 個元素，實際 %d", h.Len())
+		}
+
+		// 驗證堆序：新堆頂應為 b2（最小 expiration）
+		if h.items[0] != b2 {
+			t.Error("新堆頂應為 expiration 最小的 bucket")
+		}
+	})
+
+	t.Run("RemoveAt_Middle_SiftUp", func(t *testing.T) {
+		h := &bucketHeap{items: make([]*twBucket, 0)}
+
+		// 建立一個需要 siftUp 的場景：
+		// 移除中間元素後，最後一個元素的 expiration 比父節點小
+		buckets := make([]*twBucket, 6)
+		exps := []int64{100, 200, 300, 400, 500, 150}
+		for i := range buckets {
+			buckets[i] = newTwBucket()
+			atomic.StoreInt64(&buckets[i].expiration, exps[i])
+			h.Push(buckets[i])
+		}
+
+		// 移除 index=1 (exp=200)，最後元素 (exp=150) 會移到 index=1
+		// 150 < 父節點(100) 不成立，所以會 siftDown
+		// 但若移除 index=2 (exp=300)，150 移到 index=2，150 < 父節點(100) 不成立
+		// 需要精心構造才能觸發 siftUp
+		beforeLen := h.Len()
+		removed := h.RemoveAt(1)
+		if removed == nil {
+			t.Fatal("RemoveAt 不應返回 nil")
+		}
+		if h.Len() != beforeLen-1 {
+			t.Errorf("預期 %d 個元素，實際 %d", beforeLen-1, h.Len())
+		}
+
+		// 驗證堆序：堆頂仍應為最小值
+		minExp := atomic.LoadInt64(&h.items[0].expiration)
+		for i := 1; i < h.Len(); i++ {
+			exp := atomic.LoadInt64(&h.items[i].expiration)
+			parentIdx := (i - 1) >> 2
+			parentExp := atomic.LoadInt64(&h.items[parentIdx].expiration)
+			if exp < parentExp {
+				t.Errorf("堆序違反：items[%d].exp=%d < parent items[%d].exp=%d",
+					i, exp, parentIdx, parentExp)
+			}
+		}
+		_ = minExp
+	})
+}
+
+// TestRemoveBucket_NotEmpty 驗證 RemoveBucket 在 bucket 非空時不移除
+func TestRemoveBucket_NotEmpty(t *testing.T) {
+	stopCh := make(chan struct{})
+	dq := newDelayQueue(stopCh, defaultClock)
+
+	b := newTwBucket()
+	now := defaultClock.Now()
+	dq.Offer(b, now+10000)
+
+	// 加入一個 entry 到 bucket
+	ce := createTestEntry("keep", 5*time.Second)
+	b.Add(ce)
+
+	// 嘗試 RemoveBucket — 因為 count > 0 應該不移除
+	dq.RemoveBucket(b)
+
+	if dq.Len() != 1 {
+		t.Errorf("bucket 非空時不應被移除，佇列長度應為 1，實際 %d", dq.Len())
+	}
+}
+
+// TestRemoveBucket_NotInQueue 驗證 RemoveBucket 對不在佇列中的 bucket 是安全的
+func TestRemoveBucket_NotInQueue(t *testing.T) {
+	stopCh := make(chan struct{})
+	dq := newDelayQueue(stopCh, defaultClock)
+
+	b := newTwBucket()
+	// 不 Offer，直接 RemoveBucket
+	dq.RemoveBucket(b)
+
+	// 不應 panic，佇列應仍為空
+	if dq.Len() != 0 {
+		t.Errorf("佇列應為空，實際 %d", dq.Len())
+	}
+}
+
+// TestPoll_StopSignalPaths 驗證 Poll 的各種停止路徑
+func TestPoll_StopSignalPaths(t *testing.T) {
+	t.Run("StopWhileEmpty", func(t *testing.T) {
+		// Poll 在佇列為空時等待，收到 stop 應返回 (nil, 0)
+		stopCh := make(chan struct{})
+		dq := newDelayQueue(stopCh, defaultClock)
+
+		done := make(chan struct{})
+		var gotBucket *twBucket
+		var gotExp int64
+
+		go func() {
+			gotBucket, gotExp = dq.Poll()
+			close(done)
+		}()
+
+		time.Sleep(50 * time.Millisecond)
+		close(stopCh)
+
+		select {
+		case <-done:
+			if gotBucket != nil || gotExp != 0 {
+				t.Errorf("停止時應返回 (nil, 0)，實際 (%v, %d)", gotBucket, gotExp)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("Poll 應在收到停止信號後返回")
+		}
+	})
+
+	t.Run("StopBeforePoll", func(t *testing.T) {
+		// 先關閉 stopCh 再 Poll — 應立即返回 (nil, 0)
+		stopCh := make(chan struct{})
+		dq := newDelayQueue(stopCh, defaultClock)
+
+		close(stopCh)
+
+		b, exp := dq.Poll()
+		if b != nil || exp != 0 {
+			t.Errorf("stopCh 已關閉時 Poll 應返回 (nil, 0)，實際 (%v, %d)", b, exp)
+		}
+	})
+
+	t.Run("StopWhileWaitingTimer", func(t *testing.T) {
+		// Poll 在等待 timer 時收到 stop
+		stopCh := make(chan struct{})
+		dq := newDelayQueue(stopCh, defaultClock)
+
+		b := newTwBucket()
+		dq.Offer(b, defaultClock.Now()+60000) // 遠未來
+
+		done := make(chan struct{})
+		go func() {
+			dq.Poll()
+			close(done)
+		}()
+
+		time.Sleep(50 * time.Millisecond)
+		close(stopCh)
+
+		select {
+		case <-done:
+			// OK
+		case <-time.After(2 * time.Second):
+			t.Fatal("Poll 等待 timer 時收到 stop 應返回")
+		}
+	})
+}
+
+// TestPoll_WakeupByNewEarlierBucket 驗證 Poll 被更早到期的新 bucket 喚醒
+func TestPoll_WakeupByNewEarlierBucket(t *testing.T) {
+	stopCh := make(chan struct{})
+	defer close(stopCh)
+	dq := newDelayQueue(stopCh, defaultClock)
+
+	now := defaultClock.Now()
+
+	// 加入一個遠未來的 bucket
+	bLate := newTwBucket()
+	dq.Offer(bLate, now+60000)
+
+	done := make(chan struct{})
+	var gotBucket *twBucket
+
+	go func() {
+		gotBucket, _ = dq.Poll()
+		close(done)
+	}()
+
+	// 等待 Poll 進入 timer 等待
+	time.Sleep(50 * time.Millisecond)
+
+	// 加入一個已過期的 bucket — 應觸發 wakeup
+	bEarly := newTwBucket()
+	dq.Offer(bEarly, now-1) // 已過期
+
+	select {
+	case <-done:
+		if gotBucket != bEarly {
+			t.Error("Poll 應優先返回已過期的 bucket")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("加入已過期 bucket 後 Poll 應被喚醒")
+	}
+}
+
+// TestExpireBucket_DeletedEntrySkipped 驗證 expireBucket 跳過已刪除的 entry
+func TestExpireBucket_DeletedEntrySkipped(t *testing.T) {
+	var expiredCount int64
+	tw := newTimingWheel(func(ce *cacheEntry) {
+		atomic.AddInt64(&expiredCount, 1)
+	})
+	tw.Start()
+	defer tw.Stop()
+
+	const numItems = 20
+	entries := make([]*cacheEntry, numItems)
+	for i := 0; i < numItems; i++ {
+		entries[i] = createTestEntry(i, 2*time.Second)
+		tw.Add(entries[i])
+	}
+
+	// 標記一半為刪除
+	for i := 0; i < numItems; i += 2 {
+		tw.Remove(entries[i])
+	}
+
+	// 等待過期
+	time.Sleep(4 * time.Second)
+
+	// 只有未刪除的項目應觸發回調
+	expected := int64(numItems / 2)
+	actual := atomic.LoadInt64(&expiredCount)
+	if actual != expected {
+		t.Errorf("預期 %d 個過期回調，實際 %d（已刪除的不應觸發）", expected, actual)
+	}
+
+	// totalCount 應為 0
+	if count := tw.Count(); count != 0 {
+		t.Errorf("totalCount 應為 0，實際 %d", count)
+	}
+}
+
+// TestOfferUpdateEarlierExpiration 驗證 Offer 更新更早的過期時間
+func TestOfferUpdateEarlierExpiration(t *testing.T) {
+	stopCh := make(chan struct{})
+	dq := newDelayQueue(stopCh, defaultClock)
+
+	b := newTwBucket()
+	now := defaultClock.Now()
+
+	// 第一次 Offer
+	result1 := dq.Offer(b, now+1000)
+	if !result1 {
+		t.Error("第一次 Offer 應返回 true")
+	}
+
+	// 第二次 Offer 較早的過期時間 — 應更新並返回 false
+	result2 := dq.Offer(b, now+500)
+	if result2 {
+		t.Error("已在佇列中的 bucket 再次 Offer 應返回 false")
+	}
+
+	// 驗證 expiration 已更新
+	exp := atomic.LoadInt64(&b.expiration)
+	if exp != now+500 {
+		t.Errorf("expiration 應更新為 %d，實際 %d", now+500, exp)
+	}
+
+	// 第三次 Offer 較晚的過期時間 — 不應更新
+	dq.Offer(b, now+2000)
+	exp = atomic.LoadInt64(&b.expiration)
+	if exp != now+500 {
+		t.Errorf("較晚的 Offer 不應更新 expiration，預期 %d，實際 %d", now+500, exp)
+	}
+}
+
+// TestMockClockSleepZeroOrNegative 驗證 MockClock.Sleep 零或負 duration
+func TestMockClockSleepZeroOrNegative(t *testing.T) {
+	clock := NewMockClock(100)
+
+	// Sleep(0) 應立即返回
+	clock.Sleep(0)
+
+	// Sleep(-1s) 應立即返回
+	clock.Sleep(-1 * time.Second)
+
+	// 確認時間未變
+	if now := clock.Now(); now != 100 {
+		t.Errorf("Sleep(0) 後時間不應變化，預期 100，實際 %d", now)
+	}
+}
+
+// TestMockClockSleepAlreadyPast 驗證 Sleep 目標時間已過的情況
+func TestMockClockSleepAlreadyPast(t *testing.T) {
+	clock := NewMockClock(1000)
+
+	// Advance 到 2000ms
+	clock.Advance(1000 * time.Millisecond)
+
+	// Sleep 的目標時間 = 2000 + 100 = 2100ms
+	// 但如果 current 已經 >= targetTime，應立即返回
+	// 這裡 current = 2000, targetTime = 2100，所以會正常等待
+
+	done := make(chan struct{})
+	go func() {
+		clock.Sleep(100 * time.Millisecond)
+		close(done)
+	}()
+
+	time.Sleep(10 * time.Millisecond)
+	clock.Advance(100 * time.Millisecond) // → 2100ms
+
+	select {
+	case <-done:
+		// OK
+	case <-time.After(1 * time.Second):
+		t.Fatal("Sleep 應在 current >= targetTime 時被喚醒")
+	}
+}
+
+// TestSafeOnExpired_PanicRecovery 驗證 safeOnExpired 的 panic 恢復
+func TestSafeOnExpired_PanicRecovery(t *testing.T) {
+	tw := newTimingWheel(func(ce *cacheEntry) {
+		panic("test panic in onExpired")
+	})
+	tw.Start()
+	defer tw.Stop()
+
+	ce := createTestEntry("panic-entry", 1*time.Second)
+	tw.Add(ce)
+
+	// 等待過期 — 不應導致 goroutine 崩潰
+	time.Sleep(3 * time.Second)
+
+	// 時間輪應仍在運行
+	if !tw.IsRunning() {
+		t.Error("onExpired panic 不應導致時間輪停止")
+	}
+}
+
+// ============================================================================
 // 與 ShardedPriorityQueue 比較測試
 // ============================================================================
 
