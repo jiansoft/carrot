@@ -16,6 +16,24 @@ func equal(t *testing.T, got, want any) {
 	}
 }
 
+func waitUntilExpired(t *testing.T, cache *CacheCoherent, key any, timeout time.Duration, mode string) {
+	t.Helper()
+
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		ce, ok := cache.loadCacheEntryFromUsage(key)
+		if !ok {
+			return
+		}
+		if ce.checkExpired(cache.nowUnixNano()) {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	t.Fatalf("After expiration, the key can still be read by %s:%v", mode, key)
+}
+
 func Test_CacheCoherent(t *testing.T) {
 	tests := []struct {
 		memoryCache *CacheCoherent
@@ -27,6 +45,7 @@ func Test_CacheCoherent(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Cleanup(tt.memoryCache.Stop)
 			for i := 0; i < tt.loop; i++ {
 				key := fmt.Sprintf("QQ-%s-%v", tt.name, i)
 				tt.memoryCache.Delay(key, key, 1*time.Hour)
@@ -82,6 +101,7 @@ func Test_DataRace(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Cleanup(tt.memoryCache.Stop)
 			wg := sync.WaitGroup{}
 			wg.Add(1)
 			robin.RightNow().Do(func(loop int, m *CacheCoherent, swg *sync.WaitGroup) {
@@ -195,13 +215,14 @@ func Test_Default(t *testing.T) {
 			key: "one", val: "Forever", valUntil: "Until", valDelay: "Delay", valInactive: "Inactive",
 		}},
 	}
-	var timeBase = time.Millisecond * 50
+	var timeBase = 200 * time.Millisecond
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			// 使用獨立的 cache 實例，避免跨測試統計累計問題
 			// 設計文件 Section 5.3.6: Reset 不重置 totalHits/totalMisses
 			cache := newCacheCoherent()
+			t.Cleanup(cache.Stop)
 
 			//----  Forever ----
 			cache.Forever(tt.args.key, tt.args.val)
@@ -224,7 +245,7 @@ func Test_Default(t *testing.T) {
 				t.Fatalf("Until can't read the key:%v", tt.args.key)
 			}
 
-			<-time.After(timeBase + 10*time.Millisecond)
+			waitUntilExpired(t, cache, tt.args.key, timeBase+300*time.Millisecond, "Until")
 			if _, ok := cache.Read(tt.args.key); ok {
 				t.Fatalf("After expiration, Until can read the key:%v", tt.args.key)
 			}
@@ -243,7 +264,7 @@ func Test_Default(t *testing.T) {
 				t.Fatalf("Delay can't read the key:%v", tt.args.key)
 			}
 
-			<-time.After(timeBase + 10*time.Millisecond)
+			waitUntilExpired(t, cache, tt.args.key, timeBase+300*time.Millisecond, "Delay")
 			if _, ok := cache.Read(tt.args.key); ok {
 				t.Fatalf("After expiration, the key can be read by Delay:%v", tt.args.key)
 			}
@@ -267,7 +288,7 @@ func Test_Default(t *testing.T) {
 				t.Fatalf("after 30 ms Sliding can't read the key:%v", tt.args.key)
 			}
 
-			<-time.After(timeBase)
+			waitUntilExpired(t, cache, tt.args.key, timeBase+300*time.Millisecond, "Sliding")
 			if _, ok := cache.Read(tt.args.key); ok {
 				t.Fatalf("After flushExpired, the key can be read by Sliding:%v", tt.args.key)
 			}

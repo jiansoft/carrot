@@ -20,7 +20,6 @@ import (
 // 4. 位運算索引（wheelSize 為 2 的冪次方）
 // 5. 單調時鐘（避免壁鐘回退影響）
 // 6. Clock 介面（支援 MockClock 測試）
-// 7. sync.Pool（減少 GC 壓力）
 //
 // 架構：
 //
@@ -100,6 +99,18 @@ func nanotime() int64
 func (c *realClock) Now() int64 {
 	elapsed := nanotime() - c.startMono
 	return (c.startTime + elapsed) / int64(time.Millisecond)
+}
+
+// clockNowUnixNano returns current time in unix nanoseconds from the provided clock.
+// For realClock it preserves nanosecond precision using monotonic time; for other clock
+// implementations it falls back to millisecond precision.
+func clockNowUnixNano(clock Clock) int64 {
+	if rc, ok := clock.(*realClock); ok {
+		elapsed := nanotime() - rc.startMono
+		return rc.startTime + elapsed
+	}
+
+	return clock.Now() * int64(time.Millisecond)
 }
 
 // Sleep 睡眠指定時間
@@ -265,36 +276,6 @@ func (t *mockTimer) Reset(d time.Duration) bool {
 	wasActive := t.deadline > 0
 	t.deadline = t.clock.current + int64(d/time.Millisecond)
 	return wasActive
-}
-
-// ============================================================================
-// sync.Pool - Bucket 物件池
-// ============================================================================
-
-var bucketPool = sync.Pool{
-	New: func() any {
-		return &twBucket{
-			expiration: -1,
-			heapIndex:  -1,
-		}
-	},
-}
-
-// getBucket 從物件池取得 bucket
-func getBucket() *twBucket {
-	return bucketPool.Get().(*twBucket)
-}
-
-// putBucket 將 bucket 歸還物件池
-func putBucket(b *twBucket) {
-	// 重置狀態
-	b.head = nil
-	b.tail = nil
-	atomic.StoreInt64(&b.count, 0)
-	atomic.StoreInt64(&b.expiration, -1)
-	b.heapIndex = -1
-	b.epoch = 0
-	bucketPool.Put(b)
 }
 
 // ============================================================================
@@ -680,9 +661,12 @@ type twBucket struct {
 	epoch      uint64      // 版本號，每次 Flush 遞增
 }
 
-// newTwBucket 建立新的 bucket（使用物件池）
+// newTwBucket 建立新的 bucket
 func newTwBucket() *twBucket {
-	return getBucket()
+	return &twBucket{
+		expiration: -1,
+		heapIndex:  -1,
+	}
 }
 
 // Add 將項目加入 Bucket（頭插法，O(1)）
@@ -1090,7 +1074,17 @@ func (tw *TimingWheel) addInternal(ce *cacheEntry) bool {
 		atomic.StoreInt32(&ce.twLevel, int32(tw.level))
 
 		// 設定 Bucket 過期時間並加入 DelayQueue
+		//
+		// Level 0（最底層）維持現有語義：向上對齊到下一個 tick，
+		// 避免在同一秒槽位內過早觸發。
+		//
+		// Overflow level（level > 0）使用槽位起點（virtualID * tick），
+		// 讓 bucket 能在「接近到期前」被 flush，進而 cascade 到更低層，
+		// 最終收斂到 Level 0 的秒級精度，而不是卡在高層 tick 造成大幅延遲。
 		bucketExpiration := (virtualID + 1) * tw.tick
+		if tw.level > 0 {
+			bucketExpiration = virtualID * tw.tick
+		}
 		if bucket.SetExpiration(bucketExpiration) {
 			tw.delayQueue.Offer(bucket, bucketExpiration)
 		}

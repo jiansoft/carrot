@@ -29,7 +29,9 @@ import (
 
 // createTestEntry 建立測試用的快取項目
 func createTestEntry(key any, ttl time.Duration) *cacheEntry {
-	now := time.Now().UnixNano()
+	// 與 TimingWheel 預設時鐘保持一致，避免 time.Now 與 defaultClock.Now
+	// 在長測試執行或系統校時時產生基準偏移，導致測試偶發判定為已過期。
+	now := defaultClock.Now() * int64(time.Millisecond)
 	expireAt := now + int64(ttl)
 
 	return &cacheEntry{
@@ -360,6 +362,138 @@ func TestTimingWheelMaxLevels(t *testing.T) {
 
 	if levels > 3 {
 		t.Errorf("層級數不應超過 maxLevels，實際 %d 層", levels)
+	}
+}
+
+// TestTimingWheelLongTTLCascadeToLowerLevels 驗證長 TTL 會逐層降級到 Level 0
+func TestTimingWheelLongTTLCascadeToLowerLevels(t *testing.T) {
+	clock := NewMockClock(0)
+	tw := newTimingWheelWithClock(time.Second, 64, func(ce *cacheEntry) {}, clock)
+	tw.Start()
+	defer tw.Stop()
+
+	ttl := 26 * time.Hour
+	expNs := int64(ttl)
+	ce := &cacheEntry{
+		key:                "long-cascade",
+		value:              "v",
+		priority:           expNs,
+		absoluteExpiration: expNs,
+		twLevel:            -1,
+	}
+
+	if !tw.Add(ce) {
+		t.Fatal("26h 項目應成功加入時間輪")
+	}
+
+	// 26h 在預設配置下應先落在 Level 2
+	if lvl := atomic.LoadInt32(&ce.twLevel); lvl != 2 {
+		t.Fatalf("初始層級應為 2，實際 %d", lvl)
+	}
+
+	l1 := tw.overflowWheel.Load()
+	if l1 == nil {
+		t.Fatal("應建立 Level 1 overflow wheel")
+	}
+	l2 := l1.overflowWheel.Load()
+	if l2 == nil {
+		t.Fatal("應建立 Level 2 overflow wheel")
+	}
+
+	expMs := expNs / int64(time.Millisecond)
+	l2Boundary := (expMs / l2.tick) * l2.tick
+	l1Boundary := (expMs / l1.tick) * l1.tick
+	if l2Boundary <= 0 || l1Boundary <= l2Boundary {
+		t.Fatalf("邊界計算錯誤: l2=%d l1=%d", l2Boundary, l1Boundary)
+	}
+
+	waitLevel := func(expected int32, msg string) {
+		deadline := time.Now().Add(300 * time.Millisecond)
+		for time.Now().Before(deadline) {
+			if atomic.LoadInt32(&ce.twLevel) == expected {
+				return
+			}
+			time.Sleep(1 * time.Millisecond)
+		}
+		t.Fatalf("%s，實際 level=%d", msg, atomic.LoadInt32(&ce.twLevel))
+	}
+
+	// 尚未達到 Level 2 flush 邊界，不應降級
+	clock.Advance(time.Duration(l2Boundary-1) * time.Millisecond)
+	time.Sleep(5 * time.Millisecond)
+	if lvl := atomic.LoadInt32(&ce.twLevel); lvl != 2 {
+		t.Fatalf("L2 邊界前不應降級，實際 level=%d", lvl)
+	}
+
+	// 達到 Level 2 邊界後，應降到 Level 1
+	clock.Advance(1 * time.Millisecond)
+	waitLevel(1, "達到 L2 邊界後應降級到 Level 1")
+
+	// 尚未達到 Level 1 flush 邊界，不應再降級
+	clock.Advance(time.Duration(l1Boundary-l2Boundary-1) * time.Millisecond)
+	time.Sleep(5 * time.Millisecond)
+	if lvl := atomic.LoadInt32(&ce.twLevel); lvl != 1 {
+		t.Fatalf("L1 邊界前不應降級到 Level 0，實際 level=%d", lvl)
+	}
+
+	// 達到 Level 1 邊界後，應降到 Level 0
+	clock.Advance(1 * time.Millisecond)
+	waitLevel(0, "達到 L1 邊界後應降級到 Level 0")
+}
+
+// TestTimingWheelLongTTLExpiresWithSecondPrecision 驗證長 TTL 最終收斂到 Level 0 秒級精度
+func TestTimingWheelLongTTLExpiresWithSecondPrecision(t *testing.T) {
+	clock := NewMockClock(0)
+	var expiredCount int64
+	var expiredAtMs int64
+
+	tw := newTimingWheelWithClock(time.Second, 64, func(ce *cacheEntry) {
+		atomic.AddInt64(&expiredCount, 1)
+		atomic.StoreInt64(&expiredAtMs, clock.Now())
+	}, clock)
+	tw.Start()
+	defer tw.Stop()
+
+	ttl := 26 * time.Hour
+	expNs := int64(ttl)
+	expMs := expNs / int64(time.Millisecond)
+	ce := &cacheEntry{
+		key:                "long-precision",
+		value:              "v",
+		priority:           expNs,
+		absoluteExpiration: expNs,
+		twLevel:            -1,
+	}
+
+	if !tw.Add(ce) {
+		t.Fatal("26h 項目應成功加入時間輪")
+	}
+
+	// 先推進到目標時間，不應提前觸發
+	clock.Advance(ttl)
+	time.Sleep(5 * time.Millisecond)
+	if c := atomic.LoadInt64(&expiredCount); c != 0 {
+		t.Fatalf("到達目標時間時不應提前觸發，實際 %d 次", c)
+	}
+
+	// 再推進 1 秒（Level 0 tick）後應觸發
+	clock.Advance(1 * time.Second)
+
+	deadline := time.Now().Add(300 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if atomic.LoadInt64(&expiredCount) == 1 {
+			break
+		}
+		time.Sleep(1 * time.Millisecond)
+	}
+
+	if c := atomic.LoadInt64(&expiredCount); c != 1 {
+		t.Fatalf("目標時間 +1s 後應觸發一次，實際 %d 次", c)
+	}
+
+	got := atomic.LoadInt64(&expiredAtMs)
+	if got < expMs || got > expMs+1000 {
+		t.Fatalf("觸發時間應在 [%d, %d]ms，實際 %dms", expMs, expMs+1000, got)
 	}
 }
 

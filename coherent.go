@@ -71,18 +71,15 @@ func (cc *CacheCoherent) Forever(key, val any) {
 // Until stores an item that expires at a certain time. e.g. 2023-01-01 12:31:59.999
 // If the specified time has already passed, the existing item with the same key will be removed.
 func (cc *CacheCoherent) Until(key, val any, until time.Time) {
-	var (
-		untilUtc = until.UTC()
-		nowUtc   = time.Now().UTC()
-		ttl      = untilUtc.Sub(nowUtc)
-	)
-
+	// 使用 until.Sub(now) 保留 monotonic 語義（若 until 來源為 time.Now().Add），
+	// 避免 wall clock 調整造成短 TTL 被誤判為已過期。
+	ttl := until.Sub(time.Now())
 	if ttl <= 0 {
 		cc.Forget(key)
 		return
 	}
 
-	cc.keep(key, val, entryOptions{TimeToLive: ttl})
+	cc.keepWithNow(key, val, entryOptions{TimeToLive: ttl}, cc.nowUnixNano())
 }
 
 // Expire stores an item that expires after a period of time. e.g. time.Hour will expire after one hour from now.
@@ -128,7 +125,7 @@ func (cc *CacheCoherent) Set(key, val any, options EntryOptions) {
 // This method is atomic - if two goroutines call GetOrCreate simultaneously with the same key,
 // only one will create the entry and both will receive the same value.
 func (cc *CacheCoherent) GetOrCreate(key, val any, ttl time.Duration) (any, bool) {
-	nowUtc := time.Now().UTC().UnixNano()
+	nowUtc := cc.nowUnixNano()
 
 	// Fast path: check if already exists
 	if ce, exist := cc.loadCacheEntryFromUsage(key); exist && !ce.checkExpired(nowUtc) {
@@ -176,7 +173,7 @@ func (cc *CacheCoherent) GetOrCreateWithOptions(key, val any, options EntryOptio
 
 // Keys returns all non-expired keys in the cache.
 func (cc *CacheCoherent) Keys() []any {
-	nowUtc := time.Now().UTC().UnixNano()
+	nowUtc := cc.nowUnixNano()
 	// Pre-allocate with estimated capacity to reduce allocations
 	count := atomic.LoadInt64(&cc.usageCount)
 	keys := make([]any, 0, count)
@@ -212,7 +209,7 @@ func (cc *CacheCoherent) Compact(percentage float64) {
 		return
 	}
 
-	nowUtc := time.Now().UTC().UnixNano()
+	nowUtc := cc.nowUnixNano()
 	count := cc.Count()
 	toRemove := int(float64(count) * percentage)
 
@@ -254,8 +251,19 @@ func (cc *CacheCoherent) Compact(percentage float64) {
 
 // Keep inserts an item into the memory cache.
 func (cc *CacheCoherent) keep(key any, val any, option entryOptions) {
+	cc.keepWithNow(key, val, option, cc.nowUnixNano())
+}
+
+// nowUnixNano returns current time in unix nanoseconds using the same clock domain
+// as TimingWheel to avoid wall/monotonic divergence.
+func (cc *CacheCoherent) nowUnixNano() int64 {
+	return clockNowUnixNano(cc.em.tw.clock)
+}
+
+// keepWithNow inserts an item using a caller-provided now timestamp (unix nanoseconds).
+// This allows callers like Until to share the same time sample and avoid expiration drift.
+func (cc *CacheCoherent) keepWithNow(key any, val any, option entryOptions, nowUtc int64) {
 	var (
-		nowUtc    = time.Now().UTC().UnixNano()
 		ttl       = option.TimeToLive.Nanoseconds()
 		priority  int64
 		utcAbsExp int64
@@ -356,7 +364,7 @@ type compactBySizeEntryInfo struct {
 
 // CompactBySize removes items until the specified size is freed.
 func (cc *CacheCoherent) compactBySize(targetSize int64) {
-	nowUtc := time.Now().UTC().UnixNano()
+	nowUtc := cc.nowUnixNano()
 	count := atomic.LoadInt64(&cc.usageCount)
 
 	entries := make([]compactBySizeEntryInfo, 0, count)
@@ -445,7 +453,7 @@ func (cc *CacheCoherent) handleExpired(ce *cacheEntry) {
 //   - setLastAccessed 使用 atomic.StoreInt64，確保與 expireSlot 的讀取不會競態
 //   - TimingWheel 的 Lazy 檢查只依賴 lastAccessed + slidingExpiration
 func (cc *CacheCoherent) Read(key any) (any, bool) {
-	nowUtc := time.Now().UTC().UnixNano()
+	nowUtc := cc.nowUnixNano()
 	ce, exist := cc.loadCacheEntryFromUsage(key)
 
 	if exist && !ce.checkExpired(nowUtc) {
@@ -480,7 +488,7 @@ func (cc *CacheCoherent) Have(key any) bool {
 
 // Forget removes an item from the memory.
 func (cc *CacheCoherent) Forget(key any) {
-	cc.forget(key, time.Now().UTC().UnixNano())
+	cc.forget(key, cc.nowUnixNano())
 }
 
 func (cc *CacheCoherent) forget(key any, _ int64) {
