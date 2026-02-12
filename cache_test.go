@@ -354,6 +354,34 @@ func TestReplaceExistingKeyConcurrent(t *testing.T) {
 	}
 }
 
+func TestImmediateExpireNoSelfDeadlock(t *testing.T) {
+	cache := NewCache()
+	defer cache.Stop()
+	defer cache.Reset()
+
+	done := make(chan struct{})
+	go func() {
+		cache.Expire("k", "v", time.Nanosecond)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Expire blocked; possible key-lock reentrancy deadlock")
+	}
+
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if _, ok := cache.Read("k"); !ok {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	t.Fatal("immediately expired entry should be removed")
+}
+
 // TestGetOrCreate tests the GetOrCreate method.
 func TestGetOrCreate(t *testing.T) {
 	cache := NewCache()

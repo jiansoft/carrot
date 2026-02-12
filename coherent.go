@@ -130,12 +130,12 @@ func (cc *CacheCoherent) Set(key, val any, options EntryOptions) {
 func (cc *CacheCoherent) GetOrCreate(key, val any, ttl time.Duration) (any, bool) {
 	result := val
 	existed := false
-	cc.withKeyCreationLock(key, func() bool {
+	cc.withKeyCreationLock(key, func() *cacheEntry {
 		nowUtc := cc.nowUnixNano()
 		if cached, ok := cc.readExistingLocked(key, nowUtc); ok {
 			result = cached
 			existed = true
-			return false
+			return nil
 		}
 		return cc.keepWithNowLocked(key, val, entryOptions{TimeToLive: ttl}, nowUtc)
 	})
@@ -151,17 +151,17 @@ func (cc *CacheCoherent) GetOrCreateFunc(key any, ttl time.Duration, factory fun
 		err    error
 		exist  bool
 	)
-	cc.withKeyCreationLock(key, func() bool {
+	cc.withKeyCreationLock(key, func() *cacheEntry {
 		nowUtc := cc.nowUnixNano()
 		if cached, ok := cc.readExistingLocked(key, nowUtc); ok {
 			result = cached
 			exist = true
-			return false
+			return nil
 		}
 
 		result, err = factory()
 		if err != nil {
-			return false
+			return nil
 		}
 		return cc.keepWithNowLocked(key, result, entryOptions{TimeToLive: ttl}, cc.nowUnixNano())
 	})
@@ -175,12 +175,12 @@ func (cc *CacheCoherent) GetOrCreateFunc(key any, ttl time.Duration, factory fun
 func (cc *CacheCoherent) GetOrCreateWithOptions(key, val any, options EntryOptions) (any, bool) {
 	result := val
 	existed := false
-	cc.withKeyCreationLock(key, func() bool {
+	cc.withKeyCreationLock(key, func() *cacheEntry {
 		nowUtc := cc.nowUnixNano()
 		if cached, ok := cc.readExistingLocked(key, nowUtc); ok {
 			result = cached
 			existed = true
-			return false
+			return nil
 		}
 		return cc.keepWithNowLocked(key, val, options, nowUtc)
 	})
@@ -342,22 +342,21 @@ func mixUint64(v uint64) uint64 {
 // keepWithNow inserts an item using a caller-provided now timestamp (unix nanoseconds).
 // This allows callers like Until to share the same time sample and avoid expiration drift.
 func (cc *CacheCoherent) keepWithNow(key any, val any, option entryOptions, nowUtc int64) {
-	cc.withKeyCreationLock(key, func() bool {
+	cc.withKeyCreationLock(key, func() *cacheEntry {
 		return cc.keepWithNowLocked(key, val, option, nowUtc)
 	})
 }
 
-func (cc *CacheCoherent) withKeyCreationLock(key any, fn func() bool) {
+func (cc *CacheCoherent) withKeyCreationLock(key any, fn func() *cacheEntry) {
 	lock := cc.lockKey(key)
 	lock.Lock()
-	created := false
-	defer func() {
-		lock.Unlock()
-		if created {
-			cc.enforceSizeLimit()
-		}
-	}()
-	created = fn()
+	defer lock.Unlock()
+
+	createdEntry := fn()
+	if createdEntry != nil {
+		cc.em.Add(createdEntry)
+		cc.enforceSizeLimit()
+	}
 }
 
 func (cc *CacheCoherent) readExistingLocked(key any, nowUtc int64) (any, bool) {
@@ -377,7 +376,7 @@ func (cc *CacheCoherent) readExistingLocked(key any, nowUtc int64) (any, bool) {
 	return ce.value, true
 }
 
-func (cc *CacheCoherent) keepWithNowLocked(key any, val any, option entryOptions, nowUtc int64) bool {
+func (cc *CacheCoherent) keepWithNowLocked(key any, val any, option entryOptions, nowUtc int64) *cacheEntry {
 	var (
 		ttl       = option.TimeToLive.Nanoseconds()
 		priority  int64
@@ -437,7 +436,7 @@ func (cc *CacheCoherent) keepWithNowLocked(key any, val any, option entryOptions
 
 	if expired {
 		// newEntry 已過期，不放入快取
-		return false
+		return nil
 	}
 
 	// newEntry 未過期，正常存入
@@ -446,9 +445,8 @@ func (cc *CacheCoherent) keepWithNowLocked(key any, val any, option entryOptions
 	// 每次成功 Store 都遞增 usageCount
 	// 因為 removeEntry 已經透過 CompareAndDelete 處理了 priorEntry 的遞減
 	atomic.AddInt64(&cc.usageCount, 1)
-	cc.em.Add(newEntry)
 
-	return true
+	return newEntry
 }
 
 // EnforceSizeLimit removes items if the size limit is exceeded.

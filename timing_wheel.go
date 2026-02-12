@@ -1000,7 +1000,8 @@ func (tw *TimingWheel) Add(ce *cacheEntry) bool {
 		if absExpMs <= nowMs {
 			// 已過期，未入隊，預先標記防止 claimCount 誤扣 totalCount
 			atomic.StoreInt32(&ce.twCountClaimed, 1)
-			tw.safeOnExpired(ce)
+			// 非同步回調，避免呼叫端持有 key lock 時重入 remove 路徑造成自鎖。
+			go tw.safeOnExpired(ce)
 			return false
 		}
 	}
@@ -1020,7 +1021,8 @@ func (tw *TimingWheel) Add(ce *cacheEntry) bool {
 	// P2 修復：addInternal 返回 false 表示項目已過期
 	// 未入隊，預先標記防止 claimCount 誤扣 totalCount
 	atomic.StoreInt32(&ce.twCountClaimed, 1)
-	tw.safeOnExpired(ce)
+	// 非同步回調，避免呼叫端持有 key lock 時重入 remove 路徑造成自鎖。
+	go tw.safeOnExpired(ce)
 	return false
 }
 
