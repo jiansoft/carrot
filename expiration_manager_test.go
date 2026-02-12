@@ -122,6 +122,9 @@ func TestExpirationManagerRemove(t *testing.T) {
 	if stats.RemoveCount != 2 {
 		t.Errorf("RemoveCount = %d, want 2 (both calls counted)", stats.RemoveCount)
 	}
+	if stats.RemoveSuccessCount != 1 {
+		t.Errorf("RemoveSuccessCount = %d, want 1", stats.RemoveSuccessCount)
+	}
 }
 
 // TestExpirationManagerRemove_Forever tests Remove on Forever items.
@@ -154,6 +157,9 @@ func TestExpirationManagerRemove_Forever(t *testing.T) {
 	stats := em.Stats()
 	if stats.RemoveCount != 1 {
 		t.Errorf("RemoveCount = %d, want 1", stats.RemoveCount)
+	}
+	if stats.RemoveSuccessCount != 1 {
+		t.Errorf("RemoveSuccessCount = %d, want 1", stats.RemoveSuccessCount)
 	}
 }
 

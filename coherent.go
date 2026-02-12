@@ -2,6 +2,7 @@ package carrot
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"sort"
 	"sync"
@@ -25,6 +26,8 @@ type (
 		// maximum size limit (0 means no limit).
 		sizeLimit int64
 		stats     CacheStatistics
+		// striped per-key locks for write paths to keep per-key operations atomic.
+		keyLocks [256]sync.Mutex
 	}
 )
 
@@ -125,50 +128,63 @@ func (cc *CacheCoherent) Set(key, val any, options EntryOptions) {
 // This method is atomic - if two goroutines call GetOrCreate simultaneously with the same key,
 // only one will create the entry and both will receive the same value.
 func (cc *CacheCoherent) GetOrCreate(key, val any, ttl time.Duration) (any, bool) {
-	nowUtc := cc.nowUnixNano()
-
-	// Fast path: check if already exists
-	if ce, exist := cc.loadCacheEntryFromUsage(key); exist && !ce.checkExpired(nowUtc) {
-		atomic.AddInt64(&cc.stats.totalHits, 1)
-		ce.setLastAccessed(nowUtc)
-		if ce.isSliding() {
-			newExp := nowUtc + ce.slidingExpiration.Nanoseconds()
-			ce.setAbsoluteExpiration(newExp)
-			ce.setPriority(newExp)
+	result := val
+	existed := false
+	cc.withKeyCreationLock(key, func() bool {
+		nowUtc := cc.nowUnixNano()
+		if cached, ok := cc.readExistingLocked(key, nowUtc); ok {
+			result = cached
+			existed = true
+			return false
 		}
-		return ce.value, true
-	}
-
-	// Slow path: create new entry
-	cc.Delay(key, val, ttl)
-	return val, false
+		return cc.keepWithNowLocked(key, val, entryOptions{TimeToLive: ttl}, nowUtc)
+	})
+	return result, existed
 }
 
 // GetOrCreateFunc returns the value if the key exists, otherwise calls the factory function to create a new entry.
 // Returns the value and true if the key existed, or the new value and false if it was created.
 // If the factory function returns an error, the error is returned and no entry is created.
 func (cc *CacheCoherent) GetOrCreateFunc(key any, ttl time.Duration, factory func() (any, error)) (any, bool, error) {
-	if v, ok := cc.Read(key); ok {
-		return v, true, nil
-	}
+	var (
+		result any
+		err    error
+		exist  bool
+	)
+	cc.withKeyCreationLock(key, func() bool {
+		nowUtc := cc.nowUnixNano()
+		if cached, ok := cc.readExistingLocked(key, nowUtc); ok {
+			result = cached
+			exist = true
+			return false
+		}
 
-	val, err := factory()
+		result, err = factory()
+		if err != nil {
+			return false
+		}
+		return cc.keepWithNowLocked(key, result, entryOptions{TimeToLive: ttl}, cc.nowUnixNano())
+	})
 	if err != nil {
 		return nil, false, err
 	}
-
-	cc.Delay(key, val, ttl)
-	return val, false, nil
+	return result, exist, nil
 }
 
 // GetOrCreateWithOptions returns the value if the key exists, otherwise creates a new entry with the specified options.
 func (cc *CacheCoherent) GetOrCreateWithOptions(key, val any, options EntryOptions) (any, bool) {
-	if v, ok := cc.Read(key); ok {
-		return v, true
-	}
-
-	cc.Set(key, val, options)
-	return val, false
+	result := val
+	existed := false
+	cc.withKeyCreationLock(key, func() bool {
+		nowUtc := cc.nowUnixNano()
+		if cached, ok := cc.readExistingLocked(key, nowUtc); ok {
+			result = cached
+			existed = true
+			return false
+		}
+		return cc.keepWithNowLocked(key, val, options, nowUtc)
+	})
+	return result, existed
 }
 
 // Keys returns all non-expired keys in the cache.
@@ -260,9 +276,108 @@ func (cc *CacheCoherent) nowUnixNano() int64 {
 	return clockNowUnixNano(cc.em.tw.clock)
 }
 
+func (cc *CacheCoherent) lockKey(key any) *sync.Mutex {
+	const mask = uint64(len(cc.keyLocks) - 1)
+	return &cc.keyLocks[hashKey(key)&mask]
+}
+
+func hashKey(key any) uint64 {
+	switch k := key.(type) {
+	case string:
+		return hashString(k)
+	case int:
+		return mixUint64(uint64(k))
+	case int8:
+		return mixUint64(uint64(k))
+	case int16:
+		return mixUint64(uint64(k))
+	case int32:
+		return mixUint64(uint64(k))
+	case int64:
+		return mixUint64(uint64(k))
+	case uint:
+		return mixUint64(uint64(k))
+	case uint8:
+		return mixUint64(uint64(k))
+	case uint16:
+		return mixUint64(uint64(k))
+	case uint32:
+		return mixUint64(uint64(k))
+	case uint64:
+		return mixUint64(k)
+	case uintptr:
+		return mixUint64(uint64(k))
+	case bool:
+		if k {
+			return 1
+		}
+		return 0
+	default:
+		return hashString(fmt.Sprintf("%T:%v", key, key))
+	}
+}
+
+func hashString(s string) uint64 {
+	const (
+		offset = uint64(1469598103934665603)
+		prime  = uint64(1099511628211)
+	)
+	h := offset
+	for i := 0; i < len(s); i++ {
+		h ^= uint64(s[i])
+		h *= prime
+	}
+	return h
+}
+
+func mixUint64(v uint64) uint64 {
+	v ^= v >> 30
+	v *= 0xbf58476d1ce4e5b9
+	v ^= v >> 27
+	v *= 0x94d049bb133111eb
+	v ^= v >> 31
+	return v
+}
+
 // keepWithNow inserts an item using a caller-provided now timestamp (unix nanoseconds).
 // This allows callers like Until to share the same time sample and avoid expiration drift.
 func (cc *CacheCoherent) keepWithNow(key any, val any, option entryOptions, nowUtc int64) {
+	cc.withKeyCreationLock(key, func() bool {
+		return cc.keepWithNowLocked(key, val, option, nowUtc)
+	})
+}
+
+func (cc *CacheCoherent) withKeyCreationLock(key any, fn func() bool) {
+	lock := cc.lockKey(key)
+	lock.Lock()
+	created := false
+	defer func() {
+		lock.Unlock()
+		if created {
+			cc.enforceSizeLimit()
+		}
+	}()
+	created = fn()
+}
+
+func (cc *CacheCoherent) readExistingLocked(key any, nowUtc int64) (any, bool) {
+	ce, exist := cc.loadCacheEntryFromUsage(key)
+	if !exist || ce.checkExpired(nowUtc) {
+		return nil, false
+	}
+
+	atomic.AddInt64(&cc.stats.totalHits, 1)
+	ce.setLastAccessed(nowUtc)
+	if ce.isSliding() {
+		newExp := nowUtc + ce.slidingExpiration.Nanoseconds()
+		ce.setAbsoluteExpiration(newExp)
+		ce.setPriority(newExp)
+	}
+
+	return ce.value, true
+}
+
+func (cc *CacheCoherent) keepWithNowLocked(key any, val any, option entryOptions, nowUtc int64) bool {
 	var (
 		ttl       = option.TimeToLive.Nanoseconds()
 		priority  int64
@@ -314,7 +429,7 @@ func (cc *CacheCoherent) keepWithNow(key any, val any, option entryOptions, nowU
 	priorEntry, priorExist := cc.loadCacheEntryFromUsage(key)
 	if priorExist {
 		// 使用統一移除邏輯，原因為 Replaced
-		cc.removeEntry(key, priorEntry, int32(EvictionReasonReplaced))
+		cc.removeEntryLocked(key, priorEntry, int32(EvictionReasonReplaced))
 	}
 
 	// 判斷 newEntry 是否已過期
@@ -322,18 +437,18 @@ func (cc *CacheCoherent) keepWithNow(key any, val any, option entryOptions, nowU
 
 	if expired {
 		// newEntry 已過期，不放入快取
-		return
+		return false
 	}
 
 	// newEntry 未過期，正常存入
 	cc.usage.Store(key, newEntry)
-	cc.em.Add(newEntry)
 	atomic.AddInt64(&cc.currentSize, newEntry.size)
 	// 每次成功 Store 都遞增 usageCount
 	// 因為 removeEntry 已經透過 CompareAndDelete 處理了 priorEntry 的遞減
 	atomic.AddInt64(&cc.usageCount, 1)
+	cc.em.Add(newEntry)
 
-	cc.enforceSizeLimit()
+	return true
 }
 
 // EnforceSizeLimit removes items if the size limit is exceeded.
@@ -407,6 +522,14 @@ func (cc *CacheCoherent) compactBySize(targetSize int64) {
 //
 // 回傳：true 表示成功移除，false 表示已被其他 goroutine 處理
 func (cc *CacheCoherent) removeEntry(key any, ce *cacheEntry, reason int32) bool {
+	lock := cc.lockKey(key)
+	lock.Lock()
+	defer lock.Unlock()
+
+	return cc.removeEntryLocked(key, ce, reason)
+}
+
+func (cc *CacheCoherent) removeEntryLocked(key any, ce *cacheEntry, reason int32) bool {
 	// 1. 透過 ExpirationManager 競爭刪除權並從 TimingWheel 移除
 	// em.Remove 內部會執行 CAS atomic.CompareAndSwapInt32(&ce.deleted, 0, 1)
 	if !cc.em.Remove(ce) {

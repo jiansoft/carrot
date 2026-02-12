@@ -31,6 +31,37 @@ func BenchmarkExpireParallel(b *testing.B) {
 	})
 }
 
+// BenchmarkExpireParallelHotKey benchmarks parallel Expire operations on a single hot key.
+func BenchmarkExpireParallelHotKey(b *testing.B) {
+	cache := NewCache()
+	b.Cleanup(cache.Stop)
+	b.ResetTimer()
+
+	b.RunParallel(func(pb *testing.PB) {
+		i := 0
+		for pb.Next() {
+			cache.Expire("hotkey", i, time.Hour)
+			i++
+		}
+	})
+}
+
+// BenchmarkExpireParallelShardedKeys benchmarks parallel Expire operations across many keys.
+func BenchmarkExpireParallelShardedKeys(b *testing.B) {
+	cache := NewCache()
+	b.Cleanup(cache.Stop)
+	const keySpace = 4096
+	b.ResetTimer()
+
+	b.RunParallel(func(pb *testing.PB) {
+		i := 0
+		for pb.Next() {
+			cache.Expire(i%keySpace, i, time.Hour)
+			i++
+		}
+	})
+}
+
 // BenchmarkRead benchmarks the Read method.
 func BenchmarkRead(b *testing.B) {
 	cache := NewCache()
@@ -104,6 +135,37 @@ func BenchmarkGetOrCreateParallel(b *testing.B) {
 		i := 0
 		for pb.Next() {
 			cache.GetOrCreate(i%1000, i, time.Hour)
+			i++
+		}
+	})
+}
+
+// BenchmarkGetOrCreateParallelHotKey benchmarks parallel GetOrCreate operations on a single hot key.
+func BenchmarkGetOrCreateParallelHotKey(b *testing.B) {
+	cache := NewCache()
+	b.Cleanup(cache.Stop)
+	b.ResetTimer()
+
+	b.RunParallel(func(pb *testing.PB) {
+		i := 0
+		for pb.Next() {
+			cache.GetOrCreate("hotkey", i, time.Hour)
+			i++
+		}
+	})
+}
+
+// BenchmarkGetOrCreateParallelShardedKeys benchmarks parallel GetOrCreate operations across many keys.
+func BenchmarkGetOrCreateParallelShardedKeys(b *testing.B) {
+	cache := NewCache()
+	b.Cleanup(cache.Stop)
+	const keySpace = 4096
+	b.ResetTimer()
+
+	b.RunParallel(func(pb *testing.PB) {
+		i := 0
+		for pb.Next() {
+			cache.GetOrCreate(i%keySpace, i, time.Hour)
 			i++
 		}
 	})

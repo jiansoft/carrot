@@ -6,7 +6,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-	_ "unsafe" // for go:linkname
 )
 
 // ============================================================================
@@ -73,8 +72,8 @@ type Timer interface {
 type realClock struct {
 	// startTime 是程式啟動時的壁鐘時間（奈秒）
 	startTime int64
-	// startMono 是程式啟動時的單調時間（奈秒）
-	startMono int64
+	// startAt 保留 monotonic 讀值，供 time.Since 計算穩定經過時間
+	startAt time.Time
 }
 
 // 全域單調時鐘實例
@@ -85,19 +84,13 @@ func newRealClock() *realClock {
 	now := time.Now()
 	return &realClock{
 		startTime: now.UnixNano(),
-		startMono: nanotime(),
+		startAt:   now,
 	}
 }
 
-// nanotime 返回單調時間（奈秒）
-// 使用 runtime.nanotime 避免壁鐘回退影響
-//
-//go:linkname nanotime runtime.nanotime
-func nanotime() int64
-
 // Now 返回單調時間（毫秒）
 func (c *realClock) Now() int64 {
-	elapsed := nanotime() - c.startMono
+	elapsed := time.Since(c.startAt).Nanoseconds()
 	return (c.startTime + elapsed) / int64(time.Millisecond)
 }
 
@@ -106,7 +99,7 @@ func (c *realClock) Now() int64 {
 // implementations it falls back to millisecond precision.
 func clockNowUnixNano(clock Clock) int64 {
 	if rc, ok := clock.(*realClock); ok {
-		elapsed := nanotime() - rc.startMono
+		elapsed := time.Since(rc.startAt).Nanoseconds()
 		return rc.startTime + elapsed
 	}
 

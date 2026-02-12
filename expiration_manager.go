@@ -10,9 +10,10 @@ import (
 // 使用者可透過 ExpirationStats() 取得此結構
 type ExpirationManagerStats struct {
 	// TimingWheel 相關
-	AddCount    int64 // 加入 TW 的次數
-	RemoveCount int64 // 從 TW 移除的次數
-	ExpireCount int64 // TW 過期的次數
+	AddCount           int64 // 加入 TW 的次數
+	RemoveCount        int64 // 呼叫 Remove 的次數（嘗試次數）
+	RemoveSuccessCount int64 // Remove CAS 成功次數
+	ExpireCount        int64 // TW 過期的次數
 
 	// Forever 相關
 	ForeverCount int64 // 永不過期項目的次數
@@ -93,6 +94,7 @@ func (em *ExpirationManager) Remove(ce *cacheEntry) bool {
 		return false
 	}
 
+	atomic.AddInt64(&em.stats.RemoveSuccessCount, 1)
 	em.tw.RemoveMarked(ce)
 	return true
 }
@@ -110,10 +112,11 @@ func (em *ExpirationManager) TimingWheelCount() int {
 // Stats 回傳統計資訊的快照
 func (em *ExpirationManager) Stats() ExpirationManagerStats {
 	return ExpirationManagerStats{
-		AddCount:     atomic.LoadInt64(&em.stats.AddCount),
-		RemoveCount:  atomic.LoadInt64(&em.stats.RemoveCount),
-		ExpireCount:  atomic.LoadInt64(&em.stats.ExpireCount),
-		ForeverCount: atomic.LoadInt64(&em.stats.ForeverCount),
+		AddCount:           atomic.LoadInt64(&em.stats.AddCount),
+		RemoveCount:        atomic.LoadInt64(&em.stats.RemoveCount),
+		RemoveSuccessCount: atomic.LoadInt64(&em.stats.RemoveSuccessCount),
+		ExpireCount:        atomic.LoadInt64(&em.stats.ExpireCount),
+		ForeverCount:       atomic.LoadInt64(&em.stats.ForeverCount),
 	}
 }
 

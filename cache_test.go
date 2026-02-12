@@ -2,6 +2,7 @@ package carrot
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -319,6 +320,40 @@ func TestReplaceExistingKey(t *testing.T) {
 	}
 }
 
+func TestReplaceExistingKeyConcurrent(t *testing.T) {
+	cache := NewCache()
+	defer cache.Stop()
+	defer cache.Reset()
+
+	const goroutines = 32
+	const loopsPerGoroutine = 500
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+
+	wg.Add(goroutines)
+	for g := 0; g < goroutines; g++ {
+		id := g
+		go func() {
+			defer wg.Done()
+			<-start
+			for i := 0; i < loopsPerGoroutine; i++ {
+				cache.Expire("same-key", id*loopsPerGoroutine+i, time.Hour)
+			}
+		}()
+	}
+
+	close(start)
+	wg.Wait()
+
+	stats := cache.Statistics()
+	if stats.UsageCount() != 1 {
+		t.Fatalf("UsageCount = %d, want 1", stats.UsageCount())
+	}
+	if stats.TwCount() != 1 {
+		t.Fatalf("TwCount = %d, want 1", stats.TwCount())
+	}
+}
+
 // TestGetOrCreate tests the GetOrCreate method.
 func TestGetOrCreate(t *testing.T) {
 	cache := NewCache()
@@ -340,6 +375,43 @@ func TestGetOrCreate(t *testing.T) {
 	}
 	if val != "value1" {
 		t.Errorf("Should return existing value 'value1', got %v", val)
+	}
+}
+
+func TestGetOrCreateConcurrentAtomic(t *testing.T) {
+	cache := NewCache()
+	defer cache.Stop()
+	defer cache.Reset()
+
+	const goroutines = 128
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	var createdCount atomic.Int64
+	var existedCount atomic.Int64
+
+	wg.Add(goroutines)
+	for i := 0; i < goroutines; i++ {
+		v := i
+		go func() {
+			defer wg.Done()
+			<-start
+			_, existed := cache.GetOrCreate("key", v, time.Hour)
+			if existed {
+				existedCount.Add(1)
+			} else {
+				createdCount.Add(1)
+			}
+		}()
+	}
+
+	close(start)
+	wg.Wait()
+
+	if got := createdCount.Load(); got != 1 {
+		t.Fatalf("GetOrCreate should create exactly once, got %d", got)
+	}
+	if got := existedCount.Load(); got != goroutines-1 {
+		t.Fatalf("GetOrCreate should return existing for others, got %d", got)
 	}
 }
 
@@ -382,6 +454,57 @@ func TestGetOrCreateFunc(t *testing.T) {
 	}
 	if callCount != 1 {
 		t.Errorf("Factory should still be called only once, got %d", callCount)
+	}
+}
+
+func TestGetOrCreateFuncConcurrentAtomic(t *testing.T) {
+	cache := NewCache()
+	defer cache.Stop()
+	defer cache.Reset()
+
+	var factoryCalls atomic.Int64
+	factory := func() (any, error) {
+		factoryCalls.Add(1)
+		// 拉長 factory 執行時間，放大並發競態窗口
+		time.Sleep(100 * time.Microsecond)
+		return "created-value", nil
+	}
+
+	const goroutines = 128
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	var createdCount atomic.Int64
+	var existedCount atomic.Int64
+
+	wg.Add(goroutines)
+	for i := 0; i < goroutines; i++ {
+		go func() {
+			defer wg.Done()
+			<-start
+			_, existed, err := cache.GetOrCreateFunc("key", time.Hour, factory)
+			if err != nil {
+				t.Errorf("unexpected error: %v", err)
+				return
+			}
+			if existed {
+				existedCount.Add(1)
+			} else {
+				createdCount.Add(1)
+			}
+		}()
+	}
+
+	close(start)
+	wg.Wait()
+
+	if got := factoryCalls.Load(); got != 1 {
+		t.Fatalf("factory should be called exactly once, got %d", got)
+	}
+	if got := createdCount.Load(); got != 1 {
+		t.Fatalf("GetOrCreateFunc should create exactly once, got %d", got)
+	}
+	if got := existedCount.Load(); got != goroutines-1 {
+		t.Fatalf("GetOrCreateFunc should return existing for others, got %d", got)
 	}
 }
 
