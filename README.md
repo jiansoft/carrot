@@ -7,13 +7,13 @@
 
 [繁體中文](README.zh-TW.md)
 
-A high-performance, thread-safe in-memory cache library for Go, with 100%+ feature parity with .NET MemoryCache.
+A high-performance, thread-safe in-memory cache library for Go, with high feature parity with .NET MemoryCache.
 
 ## Features
 
 - **Multiple expiration policies** - Absolute time, sliding expiration, or never expire
 - **Thread-safe** - Uses `sync.Map` and `sync.Mutex` for concurrent access
-- **Event-driven expiration** - Hierarchical TimingWheel with O(1) batch expiration for all TTL ranges
+- **Event-driven expiration** - Hierarchical TimingWheel + DelayQueue with second-level precision by default
 - **Cache statistics** - Track hit/miss rates and usage counts
 - **Singleton & custom instances** - Use the default global instance or create your own
 - **GetOrCreate pattern** - Atomic get-or-create operations (similar to .NET's GetOrCreate)
@@ -71,10 +71,12 @@ func main() {
 | Method | Description |
 |--------|-------------|
 | `Forever(key, val any)` | Store an item that never expires |
-| `Expire(key, val any, ttl time.Duration)` | Store an item that expires after the specified duration. Use negative duration for never expire |
+| `Expire(key, val any, ttl time.Duration)` | Store an item that expires after the specified duration. Use zero or negative duration for never expire |
 | `Until(key, val any, until time.Time)` | Store an item that expires at the specified time |
 | `Sliding(key, val any, sliding time.Duration)` | Store an item with sliding expiration (resets on each access). Does nothing if duration ≤ 0 |
 | `Set(key, val any, options EntryOptions)` | Store an item with full control over all options |
+
+Compatibility aliases (deprecated): `Delay()` -> `Expire()`, `Inactive()` -> `Sliding()`.
 
 ### Read Operations
 
@@ -312,7 +314,7 @@ Items remain in cache until manually removed.
 // Never expires
 carrot.Default.Forever("config", configData)
 
-// Also never expires (negative duration)
+// Also never expires (zero or negative duration)
 carrot.Default.Expire("settings", settings, -time.Second)
 ```
 
@@ -326,7 +328,8 @@ Carrot uses a hierarchical **TimingWheel** for all expiration management:
 | **Sliding entries** | Managed by TimingWheel — lazy check on flush, O(1) Read with no data structure mutation |
 | **Forever entries** | Not placed in any expiration queue |
 
-The TimingWheel uses overflow wheels (up to 10 levels) to support arbitrary TTL ranges — from milliseconds to days and beyond.
+Default TimingWheel settings are `tick=1s`, `wheelSize=64`, and up to 10 overflow levels.
+Long TTL entries are first placed in higher levels, then cascaded down as expiration approaches, and finally converge to Level 0 (second-level precision).
 
 ### Resource Cleanup
 
@@ -335,6 +338,10 @@ When you're done using the cache, call `Stop()` to release the background gorout
 ```go
 cache := carrot.NewCache()
 defer cache.Stop()  // Release TimingWheel goroutine
+
+// For typed caches, stop via the underlying cache:
+typed := carrot.New[string, string]()
+defer typed.Underlying().Stop()
 ```
 
 ## Using Custom Instances
@@ -379,6 +386,9 @@ if total > 0 {
 emStats := carrot.Default.ExpirationStats()
 fmt.Printf("Expirations: %d\n", emStats.ExpireCount)
 fmt.Printf("Forever Items: %d\n", emStats.ForeverCount)
+
+// Note: Reset clears entries but does NOT reset TotalHits/TotalMisses.
+// It also does not fire PostEvictionCallback for each entry.
 ```
 
 ## Thread Safety
@@ -394,6 +404,8 @@ Carrot is designed for concurrent use:
 ## Performance
 
 Carrot is optimized for high-performance scenarios, comparable to .NET MemoryCache:
+
+The numbers below are reference values; run benchmarks on your target machine for real deployment expectations.
 
 | Operation | Performance | Allocations |
 |-----------|-------------|-------------|
@@ -425,7 +437,7 @@ go test -bench=. -benchmem
 
 ## .NET MemoryCache Compatibility
 
-Carrot provides 100%+ feature parity with .NET MemoryCache:
+Carrot provides high feature parity with .NET MemoryCache:
 
 | .NET MemoryCache | Carrot |
 |------------------|--------|

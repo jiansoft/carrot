@@ -7,13 +7,13 @@
 
 [English](README.md)
 
-一個高效能、執行緒安全的 Go 記憶體快取套件，與 .NET MemoryCache 100%+ 功能對等。
+一個高效能、執行緒安全的 Go 記憶體快取套件，與 .NET MemoryCache 高度功能對等。
 
 ## 功能特色
 
 - **多種過期策略** - 絕對時間過期、滑動過期、永不過期
 - **執行緒安全** - 使用 `sync.Map` 和 `sync.Mutex` 確保並發存取安全
-- **事件驅動過期管理** - 階層式時間輪，所有 TTL 範圍皆以 O(1) 批次過期處理
+- **事件驅動過期管理** - 階層式時間輪 + DelayQueue，預設秒級精度
 - **快取統計** - 追蹤命中率、未命中率及使用量
 - **單例與自訂實例** - 可使用預設全域實例或建立獨立實例
 - **GetOrCreate 模式** - 原子性的取得或建立操作（類似 .NET 的 GetOrCreate）
@@ -71,10 +71,12 @@ func main() {
 | 方法 | 說明 |
 |------|------|
 | `Forever(key, val any)` | 儲存永不過期的項目 |
-| `Expire(key, val any, ttl time.Duration)` | 儲存指定時間後過期的項目。使用負數表示永不過期 |
+| `Expire(key, val any, ttl time.Duration)` | 儲存指定時間後過期的項目。使用零或負數表示永不過期 |
 | `Until(key, val any, until time.Time)` | 儲存在指定時間點過期的項目 |
 | `Sliding(key, val any, sliding time.Duration)` | 儲存滑動過期的項目（每次存取會重置過期時間）。duration ≤ 0 時不執行任何操作 |
 | `Set(key, val any, options EntryOptions)` | 使用完整選項儲存項目 |
+
+相容別名（已棄用）：`Delay()` -> `Expire()`、`Inactive()` -> `Sliding()`。
 
 ### 讀取操作
 
@@ -312,7 +314,7 @@ val, _ := carrot.Default.Read("user-session")
 // 永不過期
 carrot.Default.Forever("config", configData)
 
-// 同樣永不過期（負數時間）
+// 同樣永不過期（零或負數時間）
 carrot.Default.Expire("settings", settings, -time.Second)
 ```
 
@@ -326,7 +328,8 @@ Carrot 使用階層式**時間輪 (TimingWheel)** 管理所有過期：
 | **滑動過期項目** | 由時間輪管理 — flush 時懶惰檢查，Read 為 O(1) 且不修改資料結構 |
 | **永久項目** | 不放入任何過期佇列 |
 
-時間輪使用溢出輪機制（最多 10 層），可支援任意 TTL 範圍 — 從毫秒到數天甚至更長。
+預設時間輪參數為 `tick=1s`、`wheelSize=64`，並支援最多 10 層溢出輪。
+長 TTL 項目會先放在高層，隨到期時間接近逐層降級，最後收斂到 Level 0（秒級精度）。
 
 ### 資源清理
 
@@ -335,6 +338,10 @@ Carrot 使用階層式**時間輪 (TimingWheel)** 管理所有過期：
 ```go
 cache := carrot.NewCache()
 defer cache.Stop()  // 釋放時間輪 goroutine
+
+// 若使用型別化快取，透過底層快取停止：
+typed := carrot.New[string, string]()
+defer typed.Underlying().Stop()
 ```
 
 ## 使用自訂實例
@@ -379,6 +386,9 @@ if total > 0 {
 emStats := carrot.Default.ExpirationStats()
 fmt.Printf("過期數: %d\n", emStats.ExpireCount)
 fmt.Printf("永久項目數: %d\n", emStats.ForeverCount)
+
+// 注意：Reset 只會清空項目，不會重設 TotalHits/TotalMisses。
+// 同時也不會對每個項目觸發 PostEvictionCallback。
 ```
 
 ## 執行緒安全
@@ -394,6 +404,8 @@ Carrot 專為並發使用而設計：
 ## 效能
 
 Carrot 針對高效能場景進行了優化，效能可與 .NET MemoryCache 比肩：
+
+下表數值為參考值；實際部署請在目標機器上執行基準測試確認。
 
 | 操作 | 效能 | 記憶體分配 |
 |------|------|-----------|
@@ -425,7 +437,7 @@ go test -bench=. -benchmem
 
 ## .NET MemoryCache 相容性
 
-Carrot 提供與 .NET MemoryCache 100%+ 功能對等：
+Carrot 提供與 .NET MemoryCache 高度功能對等：
 
 | .NET MemoryCache | Carrot |
 |------------------|--------|
